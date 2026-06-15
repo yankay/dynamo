@@ -113,6 +113,7 @@ impl KvEventSource {
                         kv_block_size,
                         next_event_id,
                         image_token_id,
+                        None,
                     ));
 
                 Ok(KvEventSource::Zmq { zmq_handle })

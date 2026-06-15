@@ -24,6 +24,7 @@ pub(crate) async fn start_zmq_listener(
     kv_block_size: u32,
     next_event_id: Arc<AtomicU64>,
     image_token_id: Option<u32>,
+    default_dp_rank: Option<u32>,
 ) {
     tracing::debug!(
         "KVEventPublisher connecting to ZMQ endpoint {} (topic '{}')",
@@ -104,7 +105,11 @@ pub(crate) async fn start_zmq_listener(
                     batch.data_parallel_rank.unwrap_or(0)
                 );
 
-                let dp_rank = batch.data_parallel_rank.unwrap_or(0).cast_unsigned();
+                let dp_rank = batch
+                    .data_parallel_rank
+                    .map(i32::cast_unsigned)
+                    .or(default_dp_rank)
+                    .unwrap_or(0);
                 for raw_event in batch.events {
                     let event_type = raw_event.event_type_label();
                     if let Some(metrics) = &metrics {

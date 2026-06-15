@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Vanilla SGLang deployment (stock SGLang server, no Dynamo runtime).
+# The native Dynamo EPP routes to these pods in external mode and discovers
+# block size / DP KV-event endpoints from SGLang /server_info.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: epp-vanilla-sglang
+  labels: { app: epp-vanilla-sglang, owner: dynamo-epp }
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }
+  selector:
+    matchLabels: { app: epp-vanilla-sglang }
+  template:
+    metadata:
+      labels: { app: epp-vanilla-sglang, owner: dynamo-epp }
+    spec:
+      tolerations:
+      - { key: nvidia.com/gpu, operator: Exists, effect: NoSchedule }
+      containers:
+      - name: sglang
+        image: lmsysorg/sglang:latest
+        command: ["python3", "-m", "sglang.launch_server"]
+        args:
+        - --model-path
+        - Qwen/Qwen3-0.6B
+        - --served-model-name
+        - Qwen/Qwen3-0.6B
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8000"
+        - --trust-remote-code
+        - --mem-fraction-static
+        - "0.45"
+        - --page-size
+        - "16"
+        - --kv-events-config
+        - '{"publisher":"zmq","endpoint":"tcp://*:5557"}'
+        ports:
+        - { name: http, containerPort: 8000 }
+        - { name: kv-events, containerPort: 5557 }
+        resources:
+          limits: { nvidia.com/gpu: "1" }
+          requests: { nvidia.com/gpu: "1" }
+        readinessProbe:
+          httpGet: { path: /health, port: 8000 }
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 60
+        startupProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+          failureThreshold: 120
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: epp-vanilla-sglang
+  labels: { app: epp-vanilla-sglang, owner: dynamo-epp }
+spec:
+  selector: { app: epp-vanilla-sglang }
+  ports:
+  - { name: http, port: 8000, targetPort: 8000 }

@@ -988,6 +988,7 @@ mod tests_startup_helpers {
                 4,
                 next_event_id,
                 None,
+                None,
             )
         });
 
@@ -1088,7 +1089,7 @@ mod tests_startup_helpers {
         let listener_handle = tokio::spawn({
             let token = token.clone();
             let endpoint = endpoint.clone();
-            start_zmq_listener(endpoint, topic, 1, tx, token, 4, next_event_id, None)
+            start_zmq_listener(endpoint, topic, 1, tx, token, 4, next_event_id, None, None)
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;

@@ -26,6 +26,10 @@ use dynamo_runtime::{DistributedRuntime, Runtime};
 
 use crate::picker::{Endpoint, EndpointPicker, PickError, PickResult, RequestInfo};
 
+mod external;
+
+use external::{ExternalEngine, resolve_external_bootstrap, spawn_kv_event_reconciler};
+
 const BOOKKEEPING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Name of the inference-serving HTTP port on a Dynamo worker pod.
@@ -85,17 +89,29 @@ impl Router {
                 )
             })
             .unwrap_or(false);
+        let external_engine = ExternalEngine::from_env();
 
         let runtime = Runtime::from_settings()?;
         let drt = DistributedRuntime::from_settings(runtime.clone()).await?;
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("failed to build EPP HTTP client");
+
+        // Endpoint discovery. External (GIE) mode scans the referenced
+        // InferencePool for its selector + targetPort; dynamo-worker mode uses
+        // the worker label convention. (Pods are labeled with the BASE
+        // namespace `nvidia.com/dynamo-namespace`, not the rolling-update
+        // -suffixed registration namespace, so the worker selector uses it.)
+        let (selector, target_port) = resolve_pod_discovery(namespace).await?;
+        let (pod_store, pod_store_ready) = spawn_pod_reflector(selector).await?;
 
         // Bootstrap model identity + tokenizer. In the default (dynamo-worker)
         // mode this comes from the worker-published ModelDeploymentCard via
         // discovery, which guarantees the EPP tokenizer matches the worker. In
-        // external mode (vanilla `vllm serve`) no Dynamo worker registers a
-        // card, so model name + block size come from env and the EPP runs
-        // WITHOUT a tokenizer: the worker tokenizes and routing is load-aware,
-        // sidestepping the tokenizer-consistency problem.
+        // external mode no Dynamo worker registers a card, so the EPP uses
+        // engine-native metadata when possible (SGLang `/server_info`) and
+        // falls back to the vLLM env contract from #10339.
         let (block_size, model_name, enable_eagle, actual_namespace, preprocessor): (
             u32,
             String,
@@ -103,17 +119,22 @@ impl Router {
             String,
             Option<Arc<OpenAIPreprocessor>>,
         ) = if external_mode {
-            let block_size = std::env::var("DYN_KV_CACHE_BLOCK_SIZE")
-                .ok()
-                .and_then(|v| v.trim().parse::<u32>().ok())
-                .unwrap_or(16);
-            let model_name = std::env::var("DYN_MODEL_NAME").unwrap_or_else(|_| "vllm".to_string());
+            let bootstrap =
+                resolve_external_bootstrap(external_engine, &http_client, &pod_store, target_port)
+                    .await;
             tracing::info!(
-                block_size,
-                model_name = %model_name,
+                block_size = bootstrap.block_size,
+                model_name = %bootstrap.model_name,
+                ?external_engine,
                 "External mode: skipping Dynamo discovery / model card; worker tokenizes, routing is load-aware"
             );
-            (block_size, model_name, false, namespace.to_string(), None)
+            (
+                bootstrap.block_size,
+                bootstrap.model_name,
+                false,
+                namespace.to_string(),
+                None,
+            )
         } else {
             // Wait for workers
             wait_for_discovery_sync(&drt).await;
@@ -191,21 +212,11 @@ impl Router {
 
         spawn_prefill_discovery_watcher(drt.clone(), actual_namespace.clone(), prefill_tx);
 
-        // Endpoint discovery. External (GIE) mode scans the referenced
-        // InferencePool for its selector + targetPort; dynamo-worker mode uses
-        // the worker label convention. (Pods are labeled with the BASE
-        // namespace `nvidia.com/dynamo-namespace`, not the rolling-update
-        // -suffixed registration namespace, so the worker selector uses it.)
-        let (selector, target_port) = resolve_pod_discovery(namespace).await?;
-        let (pod_store, pod_store_ready) = spawn_pod_reflector(selector).await?;
-
         // Precise KV-aware routing: when enabled, subscribe directly to each
-        // worker pod's native vLLM KV-cache event stream (ZMQ) and feed it into
-        // the decode router's indexer, keyed by hash_pod_name(pod). This adds
-        // ground-truth prefix overlap (what each worker has actually cached) on
-        // top of predict-on-route bookkeeping, giving precise prefix-cache
-        // routing. Requires the vLLM pods to run with `--kv-events-config` (PUB
-        // bound on DYN_EPP_KV_EVENT_PORT).
+        // worker pod's native KV-cache event stream (ZMQ) and feed it into the
+        // decode router's indexer, keyed by hash_pod_name(pod). vLLM keeps the
+        // #10339 fixed-port contract; SGLang can advertise per-DP endpoints via
+        // `/server_info.kv_events`.
         if external_mode
             && std::env::var("DYN_EPP_KV_EVENTS")
                 .map(|v| v.trim().eq_ignore_ascii_case("true"))
@@ -221,7 +232,15 @@ impl Router {
                 kv_topic = %kv_topic,
                 "Precise KV-event consumption enabled: spawning per-pod ZMQ listeners"
             );
-            spawn_kv_event_reconciler(decode_router.clone(), pod_store.clone(), kv_port, kv_topic);
+            spawn_kv_event_reconciler(
+                decode_router.clone(),
+                pod_store.clone(),
+                target_port,
+                external_engine,
+                http_client.clone(),
+                kv_port,
+                kv_topic,
+            );
         }
 
         // `model_manager` and `drt` are intentionally not stored on the
@@ -244,11 +263,6 @@ impl Router {
         } else {
             None
         };
-
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .expect("failed to build tokenizer HTTP client");
 
         Ok(Self {
             prefill_router,
@@ -1063,64 +1077,6 @@ async fn spawn_pod_reflector(
     }
 
     Ok((store, ready))
-}
-
-/// Background reconciler that keeps exactly one native vLLM KV-event ZMQ
-/// listener alive per worker pod. Each pod's events feed the decode router's
-/// indexer stamped with `hash_pod_name(pod)` — the same worker_id `pick()` uses
-/// — so the scheduler scores precise prefix overlap against each worker's real
-/// KV cache. Reconciles every 5s: registers listeners for new Ready pods and
-/// cancels them when pods disappear.
-fn spawn_kv_event_reconciler(
-    decode_router: Arc<KvRouter>,
-    pod_store: kube::runtime::reflector::Store<k8s_openapi::api::core::v1::Pod>,
-    kv_event_port: i32,
-    kv_event_topic: String,
-) {
-    tokio::spawn(async move {
-        let mut registered: std::collections::HashMap<u64, tokio_util::sync::CancellationToken> =
-            std::collections::HashMap::new();
-        loop {
-            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            for pod in pod_store.state() {
-                let Some(name) = pod.metadata.name.as_deref() else {
-                    continue;
-                };
-                let Some(ip) = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()) else {
-                    continue;
-                };
-                if !pod_is_ready(&pod) {
-                    continue;
-                }
-                let worker_id = hash_pod_name(name);
-                seen.insert(worker_id);
-                if let std::collections::hash_map::Entry::Vacant(slot) = registered.entry(worker_id)
-                {
-                    let endpoint = format!("tcp://{ip}:{kv_event_port}");
-                    let token = decode_router.register_worker_kv_events(
-                        worker_id,
-                        endpoint.clone(),
-                        kv_event_topic.clone(),
-                    );
-                    slot.insert(token);
-                    tracing::info!(%endpoint, worker_id, pod = %name, "Registered worker KV-event listener");
-                }
-            }
-            registered.retain(|worker_id, token| {
-                if seen.contains(worker_id) {
-                    true
-                } else {
-                    tracing::info!(
-                        worker_id = *worker_id,
-                        "Worker pod gone; cancelling KV-event listener"
-                    );
-                    token.cancel();
-                    false
-                }
-            });
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-    });
 }
 
 fn spawn_prefill_discovery_watcher(

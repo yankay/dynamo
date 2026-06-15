@@ -1,0 +1,97 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Inference Gateway (GAIE) topology for vanilla SGLang + native Dynamo EPP.
+# Apply into a namespace with Gateway API Inference Extension installed:
+#   kubectl -n <namespace> apply -f deploy/inference-gateway/ext-proc/examples/vanilla-sglang/
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: epp-vanilla-sglang-epp, labels: { owner: dynamo-epp } }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: epp-vanilla-sglang-epp, labels: { owner: dynamo-epp } }
+rules:
+- { apiGroups: [""], resources: [pods], verbs: [get, list, watch] }
+- { apiGroups: ["discovery.k8s.io"], resources: [endpointslices], verbs: [get, list, watch] }
+- { apiGroups: ["inference.networking.k8s.io"], resources: [inferencepools], verbs: [get, list, watch] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: epp-vanilla-sglang-epp, labels: { owner: dynamo-epp } }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: epp-vanilla-sglang-epp }
+subjects:
+- { kind: ServiceAccount, name: epp-vanilla-sglang-epp }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: epp-vanilla-sglang-epp, labels: { app: epp-vanilla-sglang-epp, owner: dynamo-epp } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: epp-vanilla-sglang-epp } }
+  template:
+    metadata: { labels: { app: epp-vanilla-sglang-epp, owner: dynamo-epp } }
+    spec:
+      serviceAccountName: epp-vanilla-sglang-epp
+      containers:
+      - name: epp
+        image: ${EPP_IMAGE}
+        args: ["dynamo-ext-proc"]
+        ports:
+        - { name: grpc-ext-proc, containerPort: 9002 }
+        - { name: health, containerPort: 9003 }
+        env:
+        - { name: DYN_EPP_EXTERNAL, value: "true" }
+        - { name: DYN_EPP_ENGINE, value: "sglang" }
+        - { name: DYN_DISCOVERY_BACKEND, value: "mem" }
+        - { name: DYN_EPP_INFERENCE_POOL, value: "epp-vanilla-sglang" }
+        # Used by the tokenizer sidecar and as a metadata fallback while pods start.
+        - { name: DYN_MODEL_NAME, value: "Qwen/Qwen3-0.6B" }
+        - { name: DYN_EPP_PREFIX_MODE, value: "precise" }
+        - { name: DYN_EPP_TOKENIZE_URL, value: "http://127.0.0.1:8790/tokenize" }
+        - { name: DYN_EPP_KV_EVENTS, value: "true" }
+        - { name: DYN_SECURE_SERVING, value: "true" }
+        - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+        readinessProbe: { tcpSocket: { port: 9003 }, initialDelaySeconds: 5, periodSeconds: 5 }
+      - name: tokenizer
+        image: ${EPP_IMAGE}
+        args: ["dynamo-ext-proc"]
+        env:
+        - { name: DYN_TOKENIZER_ONLY, value: "true" }
+        - { name: DYN_MODEL_NAME, value: "Qwen/Qwen3-0.6B" }
+        - { name: DYN_TOKENIZER_HOST, value: "127.0.0.1" }
+        - { name: DYN_TOKENIZER_PORT, value: "8790" }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: epp-vanilla-sglang-epp, labels: { owner: dynamo-epp } }
+spec:
+  selector: { app: epp-vanilla-sglang-epp }
+  ports:
+  - { name: grpc-ext-proc, port: 9002, targetPort: 9002, appProtocol: http2 }
+  - { name: health, port: 9003, targetPort: 9003 }
+---
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata: { name: epp-vanilla-sglang, labels: { owner: dynamo-epp } }
+spec:
+  selector:
+    matchLabels: { app: epp-vanilla-sglang }
+  targetPorts:
+  - { number: 8000 }
+  endpointPickerRef:
+    name: epp-vanilla-sglang-epp
+    port: { number: 9002 }
+    failureMode: FailOpen
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: epp-vanilla-sglang, labels: { owner: dynamo-epp } }
+spec:
+  parentRefs:
+  - { name: inference-gateway, namespace: agentgateway-system }
+  hostnames:
+  - epp-vanilla-sglang.local
+  rules:
+  - backendRefs:
+    - { group: inference.networking.k8s.io, kind: InferencePool, name: epp-vanilla-sglang }

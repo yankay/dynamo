@@ -744,6 +744,7 @@ where
         worker_id: protocols::WorkerId,
         zmq_endpoint: String,
         zmq_topic: String,
+        default_dp_rank: Option<u32>,
     ) -> tokio_util::sync::CancellationToken {
         let token = self.cancellation_token.child_token();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<protocols::PlacementEvent>();
@@ -787,6 +788,7 @@ where
                     block_size,
                     next_event_id.clone(),
                     None, // image_token_id: not applicable for the per-pod path
+                    default_dp_rank,
                 )
                 .await;
                 if listen_token.is_cancelled() {
