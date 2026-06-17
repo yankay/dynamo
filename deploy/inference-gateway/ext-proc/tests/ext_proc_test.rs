@@ -20,16 +20,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::{Path, State};
+use axum::routing::{delete, post};
+use axum::{Json, Router};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 
-use dynamo_ext_proc::ExtProcServer;
 use dynamo_ext_proc::picker::{Endpoint, EndpointPicker, PickError, PickResult, RequestInfo};
 use dynamo_ext_proc::proto::envoy::config::core::v3::{HeaderMap, HeaderValue};
 use dynamo_ext_proc::proto::envoy::service::ext_proc::v3::{
     self as ext_proc, ProcessingRequest, external_processor_client::ExternalProcessorClient,
     processing_response,
 };
+use dynamo_ext_proc::{ExtProcServer, SelectionPicker, SelectionPickerConfig};
 
 // ---------------------------------------------------------------------------
 // MockPicker
@@ -37,6 +41,65 @@ use dynamo_ext_proc::proto::envoy::service::ext_proc::v3::{
 
 struct MockPicker {
     result: PickResult,
+}
+
+#[derive(Clone, Default)]
+struct FakeSelectionState {
+    select_requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    prefill_complete: Arc<Mutex<Vec<String>>>,
+    deleted: Arc<Mutex<Vec<String>>>,
+}
+
+async fn start_fake_selection_service(state: FakeSelectionState) -> String {
+    let app = Router::new()
+        .route("/select_and_reserve", post(fake_select_and_reserve))
+        .route(
+            "/reservations/{reservation_id}/prefill_complete",
+            post(fake_prefill_complete),
+        )
+        .route("/reservations/{reservation_id}", delete(fake_delete))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn fake_select_and_reserve(
+    State(state): State<FakeSelectionState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    state.select_requests.lock().await.push(body);
+    Json(serde_json::json!({
+        "selection_id": "req-selection",
+        "reservation_id": "req-selection",
+        "model_name": "test-model",
+        "tenant_id": "tenant-a",
+        "worker_id": 4242,
+        "dp_rank": 7,
+        "endpoint": "http://10.0.4.2:8000",
+        "block_size": 16,
+        "overlap": {"longest_matched": 0, "gpu": 0, "dp": {"7": 0}, "cpu": 0, "disk": 0},
+        "effective_prefill_tokens": 5
+    }))
+}
+
+async fn fake_prefill_complete(
+    State(state): State<FakeSelectionState>,
+    Path(reservation_id): Path<String>,
+) -> Json<serde_json::Value> {
+    state.prefill_complete.lock().await.push(reservation_id);
+    Json(serde_json::json!({"ok": true}))
+}
+
+async fn fake_delete(
+    State(state): State<FakeSelectionState>,
+    Path(reservation_id): Path<String>,
+) -> Json<serde_json::Value> {
+    state.deleted.lock().await.push(reservation_id);
+    Json(serde_json::json!({"ok": true}))
 }
 
 #[tonic::async_trait]
@@ -328,4 +391,207 @@ async fn test_pick_result_translates_to_ext_proc_mutations() {
         .and_then(|v| v.as_str())
         .expect("model field missing");
     assert_eq!(model, "test-model", "model field preserved");
+}
+
+#[tokio::test]
+async fn test_selection_picker_calls_selection_service_and_ext_proc_mutates_request() {
+    let state = FakeSelectionState::default();
+    let selection_url = start_fake_selection_service(state.clone()).await;
+    let picker = Arc::new(
+        SelectionPicker::new(SelectionPickerConfig {
+            selection_service_url: selection_url,
+            tenant_id: "tenant-a".to_string(),
+            default_model_name: "fallback-model".to_string(),
+            timeout: Duration::from_secs(1),
+        })
+        .unwrap(),
+    );
+    let server = ExtProcServer::new(picker);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let svc = server.into_service();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = ExternalProcessorClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel::<ProcessingRequest>(10);
+    let mut response_stream = client
+        .process(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+
+    tx.send(ProcessingRequest {
+        request: Some(ext_proc::processing_request::Request::RequestHeaders(
+            ext_proc::HttpHeaders {
+                headers: Some(HeaderMap {
+                    headers: vec![
+                        HeaderValue {
+                            key: "x-request-id".to_string(),
+                            raw_value: b"req-selection".to_vec(),
+                            ..Default::default()
+                        },
+                        HeaderValue {
+                            key: "content-type".to_string(),
+                            raw_value: b"application/json".to_vec(),
+                            ..Default::default()
+                        },
+                    ],
+                }),
+                end_of_stream: false,
+            },
+        )),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let body = br#"{
+        "model": "test-model",
+        "messages": [{"role":"user","content":"hello"}],
+        "max_tokens": 16,
+        "nvext": {
+            "token_data": [11, 12, 13, 14, 15],
+            "agent_hints": {"priority": 4, "strict_priority": 8}
+        }
+    }"#;
+    tx.send(ProcessingRequest {
+        request: Some(ext_proc::processing_request::Request::RequestBody(
+            ext_proc::HttpBody {
+                body: body.to_vec(),
+                end_of_stream: true,
+            },
+        )),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let header_resp = response_stream.message().await.unwrap().unwrap();
+    let body_resp = response_stream.message().await.unwrap().unwrap();
+
+    let req_headers = match &header_resp.response {
+        Some(processing_response::Response::RequestHeaders(h)) => h,
+        other => panic!("Expected RequestHeaders response, got: {other:?}"),
+    };
+    let header_mutation = req_headers
+        .response
+        .as_ref()
+        .and_then(|response| response.header_mutation.as_ref())
+        .expect("missing request header mutation");
+    let set_headers: std::collections::HashMap<String, String> = header_mutation
+        .set_headers
+        .iter()
+        .filter_map(|h| {
+            h.header.as_ref().map(|hv| {
+                (
+                    hv.key.clone(),
+                    String::from_utf8_lossy(&hv.raw_value).to_string(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        set_headers.get("x-gateway-destination-endpoint"),
+        Some(&"10.0.4.2:8000".to_string())
+    );
+    assert_eq!(
+        set_headers.get("x-worker-instance-id"),
+        Some(&"4242".to_string())
+    );
+    assert_eq!(set_headers.get("x-dp-rank"), Some(&"7".to_string()));
+    assert_eq!(
+        set_headers.get("x-dynamo-routing-mode"),
+        Some(&"aggregated".to_string())
+    );
+
+    let req_body = match &body_resp.response {
+        Some(processing_response::Response::RequestBody(b)) => b,
+        other => panic!("Expected RequestBody response, got: {other:?}"),
+    };
+    let body_mutation = req_body
+        .response
+        .as_ref()
+        .and_then(|response| response.body_mutation.as_ref())
+        .expect("missing body mutation");
+    let streamed = match &body_mutation.mutation {
+        Some(ext_proc::body_mutation::Mutation::StreamedResponse(s)) => s,
+        other => panic!("Expected StreamedResponse body mutation, got: {other:?}"),
+    };
+    let forwarded: serde_json::Value = serde_json::from_slice(&streamed.body).unwrap();
+    assert_eq!(
+        forwarded["nvext"]["token_data"],
+        serde_json::json!([11, 12, 13, 14, 15])
+    );
+
+    tx.send(ProcessingRequest {
+        request: Some(ext_proc::processing_request::Request::ResponseHeaders(
+            ext_proc::HttpHeaders {
+                headers: Some(HeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "content-type".to_string(),
+                        raw_value: b"text/event-stream".to_vec(),
+                        ..Default::default()
+                    }],
+                }),
+                end_of_stream: false,
+            },
+        )),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    tx.send(ProcessingRequest {
+        request: Some(ext_proc::processing_request::Request::ResponseBody(
+            ext_proc::HttpBody {
+                body: b"data: token\n\n".to_vec(),
+                end_of_stream: false,
+            },
+        )),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    tx.send(ProcessingRequest {
+        request: Some(ext_proc::processing_request::Request::ResponseBody(
+            ext_proc::HttpBody {
+                body: b"data: [DONE]\n\n".to_vec(),
+                end_of_stream: true,
+            },
+        )),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    drop(tx);
+
+    while response_stream.message().await.unwrap().is_some() {}
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let selection_requests = state.select_requests.lock().await;
+    assert_eq!(selection_requests.len(), 1);
+    assert_eq!(selection_requests[0]["selection_id"], "req-selection");
+    assert_eq!(selection_requests[0]["reservation_id"], "req-selection");
+    assert_eq!(selection_requests[0]["model_name"], "test-model");
+    assert_eq!(selection_requests[0]["tenant_id"], "tenant-a");
+    assert_eq!(
+        selection_requests[0]["token_ids"],
+        serde_json::json!([11, 12, 13, 14, 15])
+    );
+    assert_eq!(selection_requests[0]["expected_output_tokens"], 16);
+    assert_eq!(selection_requests[0]["priority_jump"], 4.0);
+    assert_eq!(selection_requests[0]["strict_priority"], 8);
+    drop(selection_requests);
+
+    assert_eq!(*state.prefill_complete.lock().await, vec!["req-selection"]);
+    assert_eq!(*state.deleted.lock().await, vec!["req-selection"]);
 }

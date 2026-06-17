@@ -13,7 +13,11 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use dynamo_ext_proc::{ExtProcServer, Router};
+use dynamo_ext_proc::picker::PickError;
+use dynamo_ext_proc::{
+    Endpoint, EndpointPicker, ExtProcServer, PickResult, RequestInfo, Router, SelectionPicker,
+    SelectionPickerConfig,
+};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
@@ -36,18 +40,87 @@ struct Config {
     namespace: String,
     component: String,
     enforce_disagg: bool,
+    picker_mode: PickerMode,
+    selection_service_url: Option<String>,
+    selection_tenant_id: String,
+    selection_model_name: String,
+    selection_timeout: std::time::Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerMode {
+    Native,
+    Selection,
 }
 
 impl Config {
-    fn from_env() -> Self {
+    fn from_env() -> Result<Self> {
         let namespace = env_or("DYN_NAMESPACE_PREFIX", "")
             .or_else(|| env_or("DYN_NAMESPACE", ""))
             .unwrap_or_else(|| "vllm-agg".to_string());
+        let picker_mode = parse_picker_mode(
+            env_or("DYN_EPP_PICKER", "")
+                .unwrap_or_else(|| "native".to_string())
+                .as_str(),
+        )?;
 
-        Self {
+        Ok(Self {
             namespace,
             component: env_or("DYN_COMPONENT_NAME", "").unwrap_or_else(|| "backend".to_string()),
             enforce_disagg: parse_env("DYN_ENFORCE_DISAGG", false),
+            picker_mode,
+            selection_service_url: env_or("DYN_SELECTION_SERVICE_URL", ""),
+            selection_tenant_id: env_or("DYN_SELECTION_TENANT_ID", "")
+                .unwrap_or_else(|| "default".to_string()),
+            selection_model_name: env_or("DYN_SELECTION_MODEL_NAME", "")
+                .unwrap_or_else(|| "default".to_string()),
+            selection_timeout: std::time::Duration::from_millis(parse_env(
+                "DYN_SELECTION_SERVICE_TIMEOUT_MS",
+                2000_u64,
+            )),
+        })
+    }
+}
+
+fn parse_picker_mode(raw: &str) -> Result<PickerMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "native" => Ok(PickerMode::Native),
+        "selection" => Ok(PickerMode::Selection),
+        other => anyhow::bail!(
+            "unsupported DYN_EPP_PICKER value {other:?}; expected \"native\" or \"selection\""
+        ),
+    }
+}
+
+enum ActivePicker {
+    Native(Router),
+    Selection(SelectionPicker),
+}
+
+#[tonic::async_trait]
+impl EndpointPicker for ActivePicker {
+    async fn pick(
+        &self,
+        req: &RequestInfo,
+        endpoints: &[Endpoint],
+    ) -> Result<PickResult, PickError> {
+        match self {
+            Self::Native(router) => router.pick(req, endpoints).await,
+            Self::Selection(picker) => picker.pick(req, endpoints).await,
+        }
+    }
+
+    async fn on_prefill_complete(&self, request_id: &str) {
+        match self {
+            Self::Native(router) => router.on_prefill_complete(request_id).await,
+            Self::Selection(picker) => picker.on_prefill_complete(request_id).await,
+        }
+    }
+
+    async fn on_request_complete(&self, request_id: &str) {
+        match self {
+            Self::Native(router) => router.on_request_complete(request_id).await,
+            Self::Selection(picker) => picker.on_request_complete(request_id).await,
         }
     }
 }
@@ -68,6 +141,30 @@ fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picker_mode_defaults_to_native() {
+        assert_eq!(parse_picker_mode("").unwrap(), PickerMode::Native);
+        assert_eq!(parse_picker_mode("native").unwrap(), PickerMode::Native);
+    }
+
+    #[test]
+    fn picker_mode_accepts_selection() {
+        assert_eq!(
+            parse_picker_mode("selection").unwrap(),
+            PickerMode::Selection
+        );
+    }
+
+    #[test]
+    fn picker_mode_rejects_unknown_values() {
+        assert!(parse_picker_mode("other").is_err());
+    }
 }
 
 /// Generate a self-signed TLS acceptor for the ext-proc gRPC server.
@@ -119,7 +216,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config = Config::from_env();
+    let config = Config::from_env()?;
 
     tracing::info!(
         port = GRPC_PORT,
@@ -127,6 +224,7 @@ async fn main() -> Result<()> {
         namespace = %config.namespace,
         component = %config.component,
         enforce_disagg = config.enforce_disagg,
+        picker_mode = ?config.picker_mode,
         "Starting Dynamo Rust EPP"
     );
 
@@ -144,45 +242,78 @@ async fn main() -> Result<()> {
             .serve(health_addr),
     );
 
-    tracing::info!("Initializing KV-aware router from discovery...");
-    let router =
-        Router::from_discovery(&config.namespace, &config.component, config.enforce_disagg).await?;
+    let picker = match config.picker_mode {
+        PickerMode::Native => {
+            tracing::info!("Initializing KV-aware router from discovery...");
+            let router =
+                Router::from_discovery(&config.namespace, &config.component, config.enforce_disagg)
+                    .await?;
 
-    // Gate SERVING on pod-reflector readiness. `from_discovery` returns once
-    // worker discovery and the model card are ready, but the K8s pod reflector's
-    // initial LIST may still be in flight (it has a bounded startup timeout and
-    // then finishes in the background). `pick()` returns 503 until the reflector
-    // is ready, so reporting SERVING here unconditionally would advertise a
-    // healthy pod that rejects every request. Flip to SERVING only once the
-    // reflector cache is usable; in the common path this is already true and the
-    // transition is immediate.
-    let pod_store_ready = router.pod_store_ready();
-    if pod_store_ready.load(std::sync::atomic::Ordering::Acquire) {
-        health_reporter
-            .set_service_status(HEALTH_SERVICE_NAME, tonic_health::ServingStatus::Serving)
-            .await;
-        tracing::info!("Router initialized, health status set to SERVING");
-    } else {
-        tracing::warn!(
-            "Router initialized but pod reflector cache not ready yet; \
-             keeping health NOT_SERVING until the initial LIST completes"
-        );
-        let health_reporter = health_reporter.clone();
-        tokio::spawn(async move {
-            // Poll the readiness flag; the background reflector task flips it
-            // once the initial LIST lands. Cheap and bounded — the flag is set
-            // exactly once and the loop exits immediately after.
-            while !pod_store_ready.load(std::sync::atomic::Ordering::Acquire) {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Gate SERVING on pod-reflector readiness. `from_discovery` returns once
+            // worker discovery and the model card are ready, but the K8s pod reflector's
+            // initial LIST may still be in flight (it has a bounded startup timeout and
+            // then finishes in the background). `pick()` returns 503 until the reflector
+            // cache is usable; in the common path this is already true and the transition
+            // is immediate.
+            let pod_store_ready = router.pod_store_ready();
+            if pod_store_ready.load(std::sync::atomic::Ordering::Acquire) {
+                health_reporter
+                    .set_service_status(HEALTH_SERVICE_NAME, tonic_health::ServingStatus::Serving)
+                    .await;
+                tracing::info!("Router initialized, health status set to SERVING");
+            } else {
+                tracing::warn!(
+                    "Router initialized but pod reflector cache not ready yet; \
+                     keeping health NOT_SERVING until the initial LIST completes"
+                );
+                let health_reporter = health_reporter.clone();
+                tokio::spawn(async move {
+                    // Poll the readiness flag; the background reflector task flips it
+                    // once the initial LIST lands. Cheap and bounded — the flag is set
+                    // exactly once and the loop exits immediately after.
+                    while !pod_store_ready.load(std::sync::atomic::Ordering::Acquire) {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    health_reporter
+                        .set_service_status(
+                            HEALTH_SERVICE_NAME,
+                            tonic_health::ServingStatus::Serving,
+                        )
+                        .await;
+                    tracing::info!("Pod reflector now ready, health status set to SERVING");
+                });
             }
+
+            ActivePicker::Native(router)
+        }
+        PickerMode::Selection => {
+            let selection_service_url = config.selection_service_url.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DYN_SELECTION_SERVICE_URL is required when DYN_EPP_PICKER=selection"
+                )
+            })?;
+            tracing::info!(
+                selection_service_url = %selection_service_url,
+                tenant_id = %config.selection_tenant_id,
+                default_model_name = %config.selection_model_name,
+                timeout_ms = config.selection_timeout.as_millis(),
+                "Initializing selection-service picker"
+            );
+            let picker = SelectionPicker::new(SelectionPickerConfig {
+                selection_service_url,
+                tenant_id: config.selection_tenant_id.clone(),
+                default_model_name: config.selection_model_name.clone(),
+                timeout: config.selection_timeout,
+            })?;
             health_reporter
                 .set_service_status(HEALTH_SERVICE_NAME, tonic_health::ServingStatus::Serving)
                 .await;
-            tracing::info!("Pod reflector now ready, health status set to SERVING");
-        });
-    }
+            tracing::info!("Selection-service picker initialized, health status set to SERVING");
+            ActivePicker::Selection(picker)
+        }
+    };
 
-    let picker = Arc::new(router);
+    let picker = Arc::new(picker);
     let server = ExtProcServer::new(picker);
     // Default to TLS to match the Go EPP behavior. Verified working with
     // kGateway (`appProtocol: http2` upstreams negotiate h2 over TLS via ALPN
