@@ -73,6 +73,10 @@ Content-Type: application/json
     "0": "tcp://worker:5557",
     "1": "tcp://worker:5558"
   },
+  "metadata": {
+    "managed-by": "dynamo-operator",
+    "adapter": "external-sglang"
+  },
   "replay_endpoint": "tcp://worker:5560"
 }
 ```
@@ -80,7 +84,9 @@ Content-Type: application/json
 `POST /workers` returns `201`. `PATCH /workers/{worker_id}` updates supplied
 fields, `DELETE /workers/{worker_id}` removes the worker, and `GET /workers`
 lists catalog state. `model_name` and `tenant_id` scope all selection, indexer,
-and load state; both default to `"default"` when omitted.
+and load state; both default to `"default"` when omitted. `metadata` is an
+opaque string map returned by `GET /workers`; it does not affect readiness or
+worker selection.
 
 `GET /health` is process liveness. `GET /ready` returns `200` only after at
 least one worker is schedulable, otherwise `503` with lifecycle details.

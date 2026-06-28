@@ -988,6 +988,7 @@ mod tests {
             kv_transfer_domain: None,
             kv_transfer_enforcement: None,
             kv_transfer_preferred_weight: None,
+            metadata: HashMap::new(),
         }
     }
 
