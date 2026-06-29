@@ -41,9 +41,9 @@ func TestMetadataClientFetchesSGLangEndpoints(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"/v1/models", "/model_info", "/server_info"}, paths)
 	if len(metadata.Models.Data) != 1 ||
-		metadata.Models.Data[0].ID != "Qwen/Qwen3-0.6B" ||
+		metadata.Models.Data[0].ID != testQwen3ModelName ||
 		metadata.ModelInfo.ModelPath == "" ||
-		metadata.ServerInfo.ServedModelName != "Qwen/Qwen3-0.6B" {
+		metadata.ServerInfo.ServedModelName != testQwen3ModelName {
 		t.Fatalf("unexpected metadata: %#v", metadata)
 	}
 }

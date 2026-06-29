@@ -14,6 +14,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	testKVEventsEndpoint = "tcp://worker-0.svc:5557"
+	testModelName        = "qwen"
+	testQwen3ModelName   = "Qwen/Qwen3-0.6B"
+)
+
 func testSnapshot(t *testing.T, overrides map[string]any) MetadataSnapshot {
 	t.Helper()
 	serverInfo := map[string]any{
@@ -41,7 +47,7 @@ func testSnapshot(t *testing.T, overrides map[string]any) MetadataSnapshot {
 		serverInfo[key] = value
 	}
 	return MetadataSnapshot{
-		Models:     ModelsResponse{Data: []Model{{ID: "qwen"}}},
+		Models:     ModelsResponse{Data: []Model{{ID: testModelName}}},
 		ModelInfo:  ModelInfo{ModelPath: "/models/qwen", IsGeneration: boolRef(true)},
 		ServerInfo: jsonRoundTripServerInfo(t, serverInfo),
 	}
@@ -122,7 +128,7 @@ func TestBuildWorkerRequestReadsRealLegacyKVEventsConfigMetadata(t *testing.T) {
 		t.Fatalf("BuildWorkerRequest() error = %v", err)
 	}
 
-	if worker.WorkerID != reg.WorkerID || worker.ModelName != "Qwen/Qwen3-0.6B" || worker.TenantID != defaultTenantID {
+	if worker.WorkerID != reg.WorkerID || worker.ModelName != testQwen3ModelName || worker.TenantID != defaultTenantID {
 		t.Fatalf("unexpected worker identity: %#v", worker)
 	}
 	if worker.Endpoint != "http://worker-0.svc:30000" {
@@ -136,7 +142,7 @@ func TestBuildWorkerRequestReadsRealLegacyKVEventsConfigMetadata(t *testing.T) {
 		t.Fatalf("unexpected capacity: maxBatch=%d totalBlocks=%d",
 			worker.MaxNumBatchedTokens, worker.TotalKVBlocks)
 	}
-	if worker.KVEventsEndpoints[0] != "tcp://worker-0.svc:5557" {
+	if worker.KVEventsEndpoints[0] != testKVEventsEndpoint {
 		t.Fatalf("kv events endpoints = %#v", worker.KVEventsEndpoints)
 	}
 	if worker.StableRoutingID != "pod-uid" || worker.TopologyDomains["zone"] != "zone-a" {
@@ -157,10 +163,10 @@ func TestBuildWorkerRequestReadsRealStructuredKVEventsMetadata(t *testing.T) {
 		t.Fatalf("BuildWorkerRequest() error = %v", err)
 	}
 
-	if worker.ModelName != "Qwen/Qwen3-0.6B" || worker.BlockSize != 16 || worker.DataParallelSize != 1 {
+	if worker.ModelName != testQwen3ModelName || worker.BlockSize != 16 || worker.DataParallelSize != 1 {
 		t.Fatalf("unexpected worker metadata: %#v", worker)
 	}
-	if worker.KVEventsEndpoints[0] != "tcp://worker-0.svc:5557" {
+	if worker.KVEventsEndpoints[0] != testKVEventsEndpoint {
 		t.Fatalf("kv events endpoints = %#v", worker.KVEventsEndpoints)
 	}
 }
@@ -187,7 +193,7 @@ func TestBuildWorkerRequestReadsStructuredKVEventsMetadata(t *testing.T) {
 	if worker.IsEagle == nil || !*worker.IsEagle {
 		t.Fatalf("is_eagle = %v, want true for EAGLE3", worker.IsEagle)
 	}
-	if worker.KVEventsEndpoints[0] != "tcp://worker-0.svc:5557" || worker.KVEventsEndpoints[1] != "tcp://worker-0.svc:5558" {
+	if worker.KVEventsEndpoints[0] != testKVEventsEndpoint || worker.KVEventsEndpoints[1] != "tcp://worker-0.svc:5558" {
 		t.Fatalf("kv events endpoints = %#v", worker.KVEventsEndpoints)
 	}
 }
@@ -242,7 +248,7 @@ func TestBuildWorkerRequestUsesGlobalDPCapacityAndKVEvents(t *testing.T) {
 		t.Fatalf("BuildWorkerRequest() error = %v", err)
 	}
 
-	if worker.WorkerID != 7 || worker.ModelName != "qwen" || worker.TenantID != defaultTenantID {
+	if worker.WorkerID != 7 || worker.ModelName != testModelName || worker.TenantID != defaultTenantID {
 		t.Fatalf("unexpected worker identity: %#v", worker)
 	}
 	if got := worker.BlockSize; got != 16 {
@@ -263,7 +269,7 @@ func TestBuildWorkerRequestUsesGlobalDPCapacityAndKVEvents(t *testing.T) {
 	if worker.IsEagle == nil || !*worker.IsEagle {
 		t.Fatalf("is_eagle = %v, want true", worker.IsEagle)
 	}
-	if got := worker.KVEventsEndpoints[0]; got != "tcp://worker-0.svc:5557" {
+	if got := worker.KVEventsEndpoints[0]; got != testKVEventsEndpoint {
 		t.Fatalf("kv endpoint rank 0 = %q", got)
 	}
 	if got := worker.KVEventsEndpoints[1]; got != "tcp://worker-0.svc:5558" {
@@ -287,21 +293,21 @@ func TestBuildWorkerRequestSelectsModelFromMultipleModels(t *testing.T) {
 
 	t.Run("model path", func(t *testing.T) {
 		metadata := testSnapshot(t, map[string]any{"served_model_name": nil})
-		metadata.Models = ModelsResponse{Data: []Model{{ID: "wrong-first-model"}, {ID: "qwen"}}}
+		metadata.Models = ModelsResponse{Data: []Model{{ID: "wrong-first-model"}, {ID: testModelName}}}
 		metadata.ModelInfo.ModelPath = "/models/qwen"
 
 		worker, err := BuildWorkerRequest(testRegistration(), metadata)
 		if err != nil {
 			t.Fatalf("BuildWorkerRequest() error = %v", err)
 		}
-		if worker.ModelName != "qwen" {
+		if worker.ModelName != testModelName {
 			t.Fatalf("model name = %q, want qwen", worker.ModelName)
 		}
 	})
 
 	t.Run("no matching hint", func(t *testing.T) {
 		metadata := testSnapshot(t, map[string]any{"served_model_name": nil})
-		metadata.Models = ModelsResponse{Data: []Model{{ID: "wrong-first-model"}, {ID: "qwen"}}}
+		metadata.Models = ModelsResponse{Data: []Model{{ID: "wrong-first-model"}, {ID: testModelName}}}
 		metadata.ModelInfo.ModelPath = "/models/other"
 
 		requireBuildWorkerRequestErrorContains(t, testRegistration(), metadata, "multiple model ids")
@@ -372,7 +378,7 @@ func TestBuildWorkerRequestSupportsRegistrationMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildWorkerRequest() error = %v", err)
 	}
-	if worker.ModelName != "qwen" || worker.TenantID != "tenant-a" || worker.StableRoutingID != "pod-123" {
+	if worker.ModelName != testModelName || worker.TenantID != "tenant-a" || worker.StableRoutingID != "pod-123" {
 		t.Fatalf("registration metadata not applied: %#v", worker)
 	}
 	if worker.TopologyDomains["zone"] != "us-west" {
@@ -414,14 +420,24 @@ func TestBuildWorkerRequestRejectsDisaggregatedAndEmbeddingWorkers(t *testing.T)
 
 func TestBuildWorkerRequestHandlesOptionalAndRequiredKVEvents(t *testing.T) {
 	worker, err := BuildWorkerRequest(testRegistration(), testSnapshot(t, map[string]any{
-		"kv_events": map[string]any{"publisher": "null"},
+		"kv_events":        nil,
+		"kv_events_config": nil,
 	}))
 	if err != nil {
-		t.Fatalf("optional invalid kv_events error = %v", err)
+		t.Fatalf("optional missing kv_events error = %v", err)
 	}
 	if len(worker.KVEventsEndpoints) != 0 {
 		t.Fatalf("kv events endpoints = %#v, want omitted", worker.KVEventsEndpoints)
 	}
+
+	requireBuildWorkerRequestErrorContains(t, testRegistration(), testSnapshot(t, map[string]any{
+		"kv_events": map[string]any{"publisher": "null"},
+	}), "publisher")
+
+	requireBuildWorkerRequestErrorContains(t, testRegistration(), testSnapshot(t, map[string]any{
+		"kv_events":        nil,
+		"kv_events_config": `{"publisher":"null","topic":"kv-events","endpoint":"tcp://*:5557"}`,
+	}), "publisher")
 
 	reg := testRegistration()
 	reg.RequireKVEvents = true

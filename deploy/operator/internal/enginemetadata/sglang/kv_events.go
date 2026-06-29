@@ -16,24 +16,15 @@ import (
 
 func kvEventsEndpoints(serverInfo ServerInfo, workerEndpoint string, blockSize uint32, dpSize uint32, require bool) (map[uint32]string, error) {
 	if serverInfo.KVEvents != nil {
-		endpoints, err := kvEventsDescriptorEndpoints(*serverInfo.KVEvents, workerEndpoint, blockSize, dpSize)
-		return optionalKVEvents(endpoints, err, require)
+		return kvEventsDescriptorEndpoints(*serverInfo.KVEvents, workerEndpoint, blockSize, dpSize)
 	}
 	if len(serverInfo.KVEventsConfig) > 0 && string(serverInfo.KVEventsConfig) != "null" {
-		endpoints, err := kvEventsConfigEndpoints(serverInfo.KVEventsConfig, workerEndpoint, dpSize)
-		return optionalKVEvents(endpoints, err, require)
+		return kvEventsConfigEndpoints(serverInfo.KVEventsConfig, workerEndpoint, dpSize)
 	}
 	if require {
 		return nil, fmt.Errorf("SGLang KV events metadata is required")
 	}
 	return nil, nil
-}
-
-func optionalKVEvents(endpoints map[uint32]string, err error, require bool) (map[uint32]string, error) {
-	if err != nil && !require {
-		return nil, nil
-	}
-	return endpoints, err
 }
 
 func kvEventsDescriptorEndpoints(descriptor KVEventsDescriptor, workerEndpoint string, blockSize uint32, dpSize uint32) (map[uint32]string, error) {

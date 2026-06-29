@@ -129,7 +129,6 @@ const (
 	selectionMetadataOwnerUID     = "owner-uid"
 	selectionMetadataAdapter      = "adapter"
 	selectionMetadataSelectorURL  = "selector-url"
-	selectionDefaultTenantID      = "default"
 )
 
 // SelectionTopologyReconciler watches platform topology and reconciles raw
@@ -742,10 +741,7 @@ func selectionReconcileScopeForWorkerService(service *corev1.Service) (selection
 }
 
 func normalizeSelectionTenantID(tenantID string) string {
-	if tenantID == "" {
-		return selectionDefaultTenantID
-	}
-	return tenantID
+	return selectionservice.NormalizeTenantID(tenantID)
 }
 
 func addSelectionReconcileScopes(catalogPlans map[string]*selectorCatalogPlan, selectorTargets []selectorTarget, scope selectionReconcileScope) {
@@ -1113,8 +1109,8 @@ func catalogWorkerMatchesDesired(actual selectionservice.WorkerRecord, expected 
 
 func catalogWorkerDesiredFieldsMatch(actual selectionservice.WorkerRecord, expected selectionservice.WorkerRequest) bool {
 	return actual.WorkerID == expected.WorkerID &&
-		actual.ModelName == expected.ModelName &&
-		actual.TenantID == expected.TenantID &&
+		selectionservice.NormalizeModelName(actual.ModelName) == selectionservice.NormalizeModelName(expected.ModelName) &&
+		selectionservice.NormalizeTenantID(actual.TenantID) == selectionservice.NormalizeTenantID(expected.TenantID) &&
 		actual.Endpoint == expected.Endpoint &&
 		maps.Equal(actual.KVEventsEndpoints, expected.KVEventsEndpoints) &&
 		uintRecordFieldMatches(actual.BlockSize, expected.BlockSize) &&
@@ -1157,7 +1153,7 @@ func catalogWorkerInScope(worker selectionservice.WorkerRecord, scope selectionR
 	if scope.AdapterName != "" && metadata[selectionMetadataAdapter] != scope.AdapterName {
 		return false
 	}
-	if scope.TenantID != "" && worker.TenantID != scope.TenantID {
+	if scope.TenantID != "" && selectionservice.NormalizeTenantID(worker.TenantID) != scope.TenantID {
 		return false
 	}
 	return true
@@ -1180,7 +1176,8 @@ func endpointReady(endpoint discoveryv1.Endpoint) bool {
 }
 
 func parseOptionalBool(value string, defaultValue bool) (bool, error) {
-	if strings.TrimSpace(value) == "" {
+	value = strings.TrimSpace(value)
+	if value == "" {
 		return defaultValue, nil
 	}
 	return strconv.ParseBool(value)

@@ -186,10 +186,11 @@ Selection topology has these contracts and limits:
   non-Service selector URLs are single HTTP targets. They can work for a stable
   selector process or an external fan-out layer, but the operator cannot
   discover or replay to hidden selector replicas.
-- If required metadata is missing or invalid, the controller fails closed and
-  deactivates stale owned records instead of publishing partial workers. The
-  selection service keeps deactivated records as `unschedulable` tombstones
-  until a future purge or active-only catalog view is available.
+- If required metadata is missing or invalid, the controller fails closed
+  instead of publishing partial workers. Stale-record deactivation is best
+  effort; operator restarts or deletion of the last annotated worker `Service`
+  can leave visible `unschedulable` tombstones until a later reconcile/sweep or
+  future purge/active-only catalog view handles them.
 - `nvidia.com/dynamo-selection-require-kv-events` controls operator-side
   metadata validation only and defaults to `"true"`. The selection service still
   decides schedulability. With the default `DYN_USE_KV_EVENTS=true`, every worker

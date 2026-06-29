@@ -14,6 +14,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // defaultRequestTimeout is the fallback HTTP request timeout used when the caller
@@ -86,7 +88,11 @@ func (c *MetadataClient) getJSON(ctx context.Context, path string, target any) e
 	if err != nil {
 		return fmt.Errorf("SGLang metadata %s failed: %w", operation, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.FromContext(ctx).V(1).Info("Failed to close SGLang metadata response body", "operation", operation, "error", closeErr)
+		}
+	}()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

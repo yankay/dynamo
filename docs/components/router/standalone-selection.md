@@ -82,11 +82,12 @@ Content-Type: application/json
 ```
 
 `POST /workers` returns `201`. `PATCH /workers/{worker_id}` updates supplied
-fields, `DELETE /workers/{worker_id}` removes the worker, and `GET /workers`
-lists catalog state. `model_name` and `tenant_id` scope all selection, indexer,
-and load state; both default to `"default"` when omitted. `metadata` is an
-opaque string map returned by `GET /workers`; it does not affect readiness or
-worker selection.
+fields, and `DELETE /workers/{worker_id}` deactivates the worker by marking it
+`unschedulable`. Deactivated records remain visible in `GET /workers` and
+`GET /ready` `workers`; use `lifecycle` or `schedulable_workers` for active
+worker views. `model_name` and `tenant_id` scope all selection, indexer, and load
+state; both default to `"default"` when omitted. `metadata` is an opaque string
+map returned by `GET /workers`; it does not affect readiness or worker selection.
 
 `GET /health` is process liveness. `GET /ready` returns `200` only after at
 least one worker is schedulable, otherwise `503` with lifecycle details.

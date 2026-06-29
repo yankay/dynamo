@@ -5,9 +5,38 @@
 
 package selectionservice
 
+import "strings"
+
 // These structs mirror the runtime-free selection service worker API in
 // lib/kv-router/src/services/selection/types.rs. Keep the JSON field names in
 // sync with WorkerRequest and WorkerCatalogRecord there.
+
+const (
+	// Rust deserializes omitted model_name to "default"; normalize Go requests to
+	// the same value so controller diffs compare against the catalog record.
+	DefaultModelName = "default"
+	// Rust deserializes omitted tenant_id to "default"; normalize Go requests to
+	// the same value so controller diffs compare against the catalog record.
+	DefaultTenantID = "default"
+)
+
+// NormalizeModelName applies the selection service model_name default.
+func NormalizeModelName(modelName string) string {
+	return normalizeDefaultString(modelName, DefaultModelName)
+}
+
+// NormalizeTenantID applies the selection service tenant_id default.
+func NormalizeTenantID(tenantID string) string {
+	return normalizeDefaultString(tenantID, DefaultTenantID)
+}
+
+func normalizeDefaultString(value string, defaultValue string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return defaultValue
+	}
+	return value
+}
 
 // WorkerRequest is the platform-neutral worker registration payload accepted by
 // the runtime-free selection service POST /workers API.

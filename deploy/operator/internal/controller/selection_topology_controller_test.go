@@ -48,7 +48,12 @@ type selectionRecorder struct {
 	workers    map[uint64]selectionservice.WorkerRecord
 }
 
-const selectionWorkersPath = "/workers"
+const (
+	selectionWorkersPath  = "/workers"
+	testOwnerKindService  = "Service"
+	testSelectorNamespace = "selection"
+	testTenantA           = "tenant-a"
+)
 
 type fakeSGLangMetadataFetcher struct {
 	snapshot sglang.MetadataSnapshot
@@ -124,7 +129,7 @@ func TestSelectionTopologyReconcilerReconcilesWorkerIntoSelectionService(t *test
 	assert.Equal(t, sglangServer.URL, posted.Endpoint)
 	assert.Equal(t, "zone-a", posted.TopologyDomains["zone"])
 	assert.Equal(t, selectionMetadataManagedByVal, posted.Metadata[selectionMetadataManagedBy])
-	assert.Equal(t, "Service", posted.Metadata[selectionMetadataOwnerKind])
+	assert.Equal(t, testOwnerKindService, posted.Metadata[selectionMetadataOwnerKind])
 	assert.Equal(t, selectionAdapterExternalSGLang, posted.Metadata[selectionMetadataAdapter])
 	assert.Equal(t, selectionServer.URL, posted.Metadata[selectionMetadataSelectorURL])
 	assert.Empty(t, recorderDeletes(recorder))
@@ -183,6 +188,34 @@ func TestSelectionTopologyReconcilerAllowsMissingKVEventsWhenExplicitlyOptional(
 	assert.Empty(t, posts[0].KVEventsEndpoints)
 }
 
+func TestParseOptionalBool(t *testing.T) {
+	tests := []struct {
+		name         string
+		value        string
+		defaultValue bool
+		want         bool
+		wantErr      bool
+	}{
+		{name: "empty uses default", value: "", defaultValue: true, want: true},
+		{name: "whitespace uses default", value: " \n\t", defaultValue: false, want: false},
+		{name: "trims true", value: " true\n", defaultValue: false, want: true},
+		{name: "trims false", value: "\tfalse ", defaultValue: true, want: false},
+		{name: "invalid", value: "maybe", defaultValue: true, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseOptionalBool(tt.value, tt.defaultValue)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestSelectionTopologyReconcilerUsesInjectedSGLangMetadataClientFactory(t *testing.T) {
 	selectionServer, recorder := newFakeSelectionServer(t)
 	defer selectionServer.Close()
@@ -236,12 +269,12 @@ func TestSelectionTopologyReconcilerHandlesOverlappingWorkerServices(t *testing.
 
 		posts := recorderPosts(recorder)
 		require.Len(t, posts, 1)
-		assert.Equal(t, "tenant-a", posts[0].TenantID)
+		assert.Equal(t, testTenantA, posts[0].TenantID)
 		assert.Empty(t, recorderDeletes(recorder))
 		workerID := workerIDForPod(pod)
 		record, ok := recorderWorker(recorder, workerID)
 		require.True(t, ok)
-		assert.Equal(t, "tenant-a", record.TenantID)
+		assert.Equal(t, testTenantA, record.TenantID)
 		assert.Equal(t, serviceA.Name, record.Metadata[selectionMetadataOwnerName])
 		assert.Equal(t, selectionservice.WorkerLifecycleSchedulable, record.Lifecycle)
 
@@ -250,7 +283,7 @@ func TestSelectionTopologyReconcilerHandlesOverlappingWorkerServices(t *testing.
 		assert.Empty(t, recorderDeletes(recorder))
 		record, ok = recorderWorker(recorder, workerID)
 		require.True(t, ok)
-		assert.Equal(t, "tenant-a", record.TenantID)
+		assert.Equal(t, testTenantA, record.TenantID)
 		assert.Equal(t, selectionservice.WorkerLifecycleSchedulable, record.Lifecycle)
 	})
 
@@ -299,7 +332,7 @@ func TestSelectionTopologyReconcilerFailsClosedAndDeactivatesKnownWorker(t *test
 		recorder.workers[workerID] = selectionservice.WorkerRecord{
 			WorkerID:  workerID,
 			ModelName: "Qwen/Qwen3-0.6B",
-			TenantID:  "tenant-a",
+			TenantID:  testTenantA,
 			Metadata:  selectionTestWorkerMetadata(service, selectionServer.URL, selectionAdapterExternalSGLang),
 		}
 
@@ -418,7 +451,7 @@ func TestSelectionTopologyReconcilerReconcilesScopedCatalogDeactivation(t *testi
 				return []selectionservice.WorkerRecord{{
 					WorkerID:  99,
 					ModelName: "qwen",
-					TenantID:  "tenant-a",
+					TenantID:  testTenantA,
 					Metadata:  selectionTestWorkerMetadata(service, selectorURL, selectionAdapterExternalSGLang),
 				}}
 			},
@@ -432,7 +465,7 @@ func TestSelectionTopologyReconcilerReconcilesScopedCatalogDeactivation(t *testi
 				return []selectionservice.WorkerRecord{{
 					WorkerID:  99,
 					ModelName: "qwen",
-					TenantID:  "tenant-a",
+					TenantID:  testTenantA,
 					Metadata:  selectionTestWorkerMetadata(service, selectorURL, selectionAdapterExternalSGLang),
 				}}
 			},
@@ -446,7 +479,7 @@ func TestSelectionTopologyReconcilerReconcilesScopedCatalogDeactivation(t *testi
 					{
 						WorkerID:  100,
 						ModelName: "other-model",
-						TenantID:  "tenant-a",
+						TenantID:  testTenantA,
 						Metadata:  selectionTestWorkerMetadata(service, selectorURL, selectionAdapterExternalSGLang),
 					},
 					{
@@ -458,7 +491,7 @@ func TestSelectionTopologyReconcilerReconcilesScopedCatalogDeactivation(t *testi
 					{
 						WorkerID:  102,
 						ModelName: "qwen",
-						TenantID:  "tenant-a",
+						TenantID:  testTenantA,
 						Metadata:  selectionTestWorkerMetadata(service, selectorURL, "external-vllm"),
 					},
 				}
@@ -473,7 +506,7 @@ func TestSelectionTopologyReconcilerReconcilesScopedCatalogDeactivation(t *testi
 				return []selectionservice.WorkerRecord{{
 					WorkerID:  100,
 					ModelName: "qwen",
-					TenantID:  "tenant-a",
+					TenantID:  testTenantA,
 					Metadata: map[string]string{
 						selectionMetadataManagedBy: "someone-else",
 					},
@@ -578,7 +611,7 @@ func TestSelectionTopologyReconcilerDeactivatesOrphanedOwnerServiceWorker(t *tes
 			recorder.workers[orphanWorkerID] = selectionservice.WorkerRecord{
 				WorkerID:  orphanWorkerID,
 				ModelName: "orphan-model",
-				TenantID:  "tenant-a",
+				TenantID:  testTenantA,
 				Lifecycle: selectionservice.WorkerLifecycleSchedulable,
 				Endpoint:  "http://orphan-worker.default.svc:30000",
 				Metadata:  selectionTestWorkerMetadata(orphanService, selectionServer.URL, selectionAdapterExternalSGLang),
@@ -661,7 +694,7 @@ func TestSelectionTopologyWorkerMatchesDesired(t *testing.T) {
 	expected := selectionservice.WorkerRequest{
 		WorkerID:              1,
 		ModelName:             "qwen",
-		TenantID:              "tenant-a",
+		TenantID:              testTenantA,
 		Endpoint:              "http://worker.default.svc:30000",
 		KVEventsEndpoints:     map[uint32]string{0: "tcp://worker.default.svc:5557"},
 		BlockSize:             16,
@@ -711,6 +744,16 @@ func TestSelectionTopologyWorkerMatchesDesired(t *testing.T) {
 			assert.Equal(t, tt.want, catalogWorkerMatchesDesired(actual, expected))
 		})
 	}
+
+	t.Run("defaulted worker key matches omitted desired key", func(t *testing.T) {
+		desired := expected
+		desired.ModelName = ""
+		desired.TenantID = ""
+		actual := selectionWorkerRecordFromRequest(desired)
+		actual.ModelName = selectionservice.DefaultModelName
+		actual.TenantID = selectionservice.DefaultTenantID
+		assert.True(t, catalogWorkerMatchesDesired(actual, desired))
+	})
 }
 
 func TestSelectionTopologyReconcilerRepostsDriftedCatalogWorker(t *testing.T) {
@@ -782,7 +825,7 @@ func TestSelectionTopologyReconcilerRegistersFixtureWorkerOnEverySelectorReplica
 	service.Annotations[consts.KubeAnnotationDynamoSelectionServiceURL] = " http://selector.selection.svc/ "
 	service.Annotations[consts.KubeAnnotationDynamoSelectionRequireKVEvents] = "true"
 	selectorService := rawSelectorService()
-	selectorService.Namespace = "selection"
+	selectorService.Namespace = testSelectorNamespace
 	selectorSliceA := selectorEndpointSliceForURL(t, "selector-a", selectorA.URL, selectorService.Namespace)
 	selectorSliceB := selectorEndpointSliceForURL(t, "selector-b", selectorB.URL, selectorService.Namespace)
 	reconciler := newSelectionTopologyTestReconciler(t, service, pod, workerSlice, selectorService, selectorSliceA, selectorSliceB)
@@ -793,7 +836,7 @@ func TestSelectionTopologyReconcilerRegistersFixtureWorkerOnEverySelectorReplica
 	postsB := recorderPosts(recorderB)
 	require.Len(t, postsA, 1)
 	require.Len(t, postsB, 1)
-	selectorScopeKey := selectorServiceScopeKey("selection", "selector", "")
+	selectorScopeKey := selectorServiceScopeKey(testSelectorNamespace, "selector", "")
 	assertFixtureBackedSGLangWorker(t, postsA[0], service, pod, sglangServer.URL, selectorScopeKey)
 	assertFixtureBackedSGLangWorker(t, postsB[0], service, pod, sglangServer.URL, selectorScopeKey)
 	assert.Equal(t, postsA[0].Metadata[selectionMetadataSelectorURL], postsB[0].Metadata[selectionMetadataSelectorURL])
@@ -808,7 +851,7 @@ func TestSelectionTopologyReconcilerUsesSelectorEndpointSliceTargetPort(t *testi
 	service, pod, workerSlice := rawNamespacedSGLangWorkerObjects(t, sglangServer.URL, "http://selector.selection.svc:80", "workers")
 	service.Annotations[consts.KubeAnnotationDynamoSelectionRequireKVEvents] = "true"
 	selectorService := rawSelectorService()
-	selectorService.Namespace = "selection"
+	selectorService.Namespace = testSelectorNamespace
 	selectorHost, selectorTargetPort := splitTestServerAddress(t, selectorServer.URL)
 	selectorSlice := selectorEndpointSlice("selector-a", selectorHost, selectorTargetPort, selectorService.Namespace)
 	selectorService.Spec.Ports = []corev1.ServicePort{
@@ -824,13 +867,13 @@ func TestSelectionTopologyReconcilerUsesSelectorEndpointSliceTargetPort(t *testi
 
 	posts := recorderPosts(recorder)
 	require.Len(t, posts, 1)
-	assert.Equal(t, selectorServiceScopeKey("selection", "selector", "80"), posts[0].Metadata[selectionMetadataSelectorURL])
+	assert.Equal(t, selectorServiceScopeKey(testSelectorNamespace, "selector", "80"), posts[0].Metadata[selectionMetadataSelectorURL])
 }
 
 func TestSelectionTopologyReconcilerUsesStableSelectorScopeForServiceTargets(t *testing.T) {
 	ctx := context.Background()
 	rawURL := "http://selector.selection.svc"
-	scopeKey := selectorServiceScopeKey("selection", "selector", "")
+	scopeKey := selectorServiceScopeKey(testSelectorNamespace, "selector", "")
 
 	t.Run("service DNS fallback", func(t *testing.T) {
 		reconciler := newSelectionTopologyTestReconciler(t)
@@ -844,7 +887,7 @@ func TestSelectionTopologyReconcilerUsesStableSelectorScopeForServiceTargets(t *
 
 	t.Run("resolved service endpoints", func(t *testing.T) {
 		selectorService := rawSelectorService()
-		selectorService.Namespace = "selection"
+		selectorService.Namespace = testSelectorNamespace
 		selectorSlice := selectorEndpointSlice("selector-a", "10.2.0.3", 8092, selectorService.Namespace)
 		reconciler := newSelectionTopologyTestReconciler(t, selectorService, selectorSlice)
 		selectorTargets, err := reconciler.selectorTargetsForURL(ctx, rawURL, "workers")
@@ -868,7 +911,7 @@ func TestSelectionTopologyReconcilerRequeuesWhenSelectorHasNoReadyTargets(t *tes
 
 	service, pod, workerSlice := rawNamespacedSGLangWorkerObjects(t, sglangServer.URL, "http://selector.selection.svc", "workers")
 	selectorService := rawSelectorService()
-	selectorService.Namespace = "selection"
+	selectorService.Namespace = testSelectorNamespace
 	selectorSlice := selectorEndpointSlice("selector-a", "10.2.0.3", 8092, selectorService.Namespace)
 	selectorSlice.Endpoints[0].Conditions.Ready = ptr.To(false)
 	reconciler := newSelectionTopologyTestReconciler(t, service, pod, workerSlice, selectorService, selectorSlice)
@@ -890,7 +933,7 @@ func TestSelectionTopologyReconcilerSelectorEndpointSliceChangeEnqueuesWorkerSer
 
 	service, pod, workerSlice := rawNamespacedSGLangWorkerObjects(t, sglangServer.URL, "http://selector.selection.svc", "workers")
 	selectorService := rawSelectorService()
-	selectorService.Namespace = "selection"
+	selectorService.Namespace = testSelectorNamespace
 	selectorSliceA := selectorEndpointSliceForURL(t, "selector-a", selectorA.URL, selectorService.Namespace)
 	selectorSliceB := selectorEndpointSliceForURL(t, "selector-b", selectorB.URL, selectorService.Namespace)
 	reconciler := newSelectionTopologyTestReconciler(t, service, pod, workerSlice, selectorService, selectorSliceA)
@@ -918,7 +961,7 @@ func TestSelectionTopologyReconcilerIgnoresInactiveSelectorCleanupFailure(t *tes
 
 	service, pod, workerSlice := rawNamespacedSGLangWorkerObjects(t, sglangServer.URL, "http://selector.selection.svc", "workers")
 	selectorService := rawSelectorService()
-	selectorService.Namespace = "selection"
+	selectorService.Namespace = testSelectorNamespace
 	selectorSliceA := selectorEndpointSliceForURL(t, "selector-a", selectorA.URL, selectorService.Namespace)
 	selectorSliceB := selectorEndpointSliceForURL(t, "selector-b", selectorB.URL, selectorService.Namespace)
 	reconciler := newSelectionTopologyTestReconciler(t, service, pod, workerSlice, selectorService, selectorSliceA)
@@ -941,7 +984,7 @@ func TestSelectionTopologyReconcilerWatchMappers(t *testing.T) {
 	service, workerPod, workerSlice := rawNamespacedSGLangWorkerObjects(t, "http://10.0.0.1:30000", "http://selector.selection.svc", "workers")
 	service.Annotations[consts.KubeAnnotationDynamoSelectionServiceURL] = " http://selector.selection.svc/ "
 	selectorService := rawSelectorService()
-	selectorService.Namespace = "selection"
+	selectorService.Namespace = testSelectorNamespace
 	selectorPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "selector-0",
@@ -960,7 +1003,7 @@ func TestSelectionTopologyReconcilerWatchMappers(t *testing.T) {
 			Name:      "plain-service",
 			Namespace: "default",
 			Annotations: map[string]string{
-				consts.KubeAnnotationDynamoSelectionTenantID: "tenant-a",
+				consts.KubeAnnotationDynamoSelectionTenantID: testTenantA,
 			},
 		},
 	}
@@ -1021,7 +1064,7 @@ func TestSelectionTopologyServicePredicate(t *testing.T) {
 			Name:      "tenant-only-service",
 			Namespace: "default",
 			Annotations: map[string]string{
-				consts.KubeAnnotationDynamoSelectionTenantID: "tenant-a",
+				consts.KubeAnnotationDynamoSelectionTenantID: testTenantA,
 			},
 		},
 	}
@@ -1203,7 +1246,7 @@ func assertFixtureBackedSGLangWorker(
 	t.Helper()
 	assert.Equal(t, workerIDForPod(pod), worker.WorkerID)
 	assert.Equal(t, "Qwen/Qwen3-0.6B", worker.ModelName)
-	assert.Equal(t, "tenant-a", worker.TenantID)
+	assert.Equal(t, testTenantA, worker.TenantID)
 	assert.Equal(t, workerEndpoint, worker.Endpoint)
 	assert.Equal(t, uint32(16), worker.BlockSize)
 	assert.Equal(t, uint32(1), worker.DataParallelSize)
@@ -1217,7 +1260,7 @@ func assertFixtureBackedSGLangWorker(
 	assert.Empty(t, worker.StableRoutingID)
 	assert.Equal(t, "zone-a", worker.TopologyDomains["zone"])
 	assert.Equal(t, selectionMetadataManagedByVal, worker.Metadata[selectionMetadataManagedBy])
-	assert.Equal(t, "Service", worker.Metadata[selectionMetadataOwnerKind])
+	assert.Equal(t, testOwnerKindService, worker.Metadata[selectionMetadataOwnerKind])
 	assert.Equal(t, service.Namespace, worker.Metadata[selectionMetadataOwnerNS])
 	assert.Equal(t, service.Name, worker.Metadata[selectionMetadataOwnerName])
 	assert.Equal(t, string(service.UID), worker.Metadata[selectionMetadataOwnerUID])
@@ -1313,7 +1356,7 @@ func rawSGLangPod(selectorURL string) *corev1.Pod {
 			Annotations: map[string]string{
 				consts.KubeAnnotationDynamoSelectionAdapter:    selectionAdapterExternalSGLang,
 				consts.KubeAnnotationDynamoSelectionServiceURL: selectorURL,
-				consts.KubeAnnotationDynamoSelectionTenantID:   "tenant-a",
+				consts.KubeAnnotationDynamoSelectionTenantID:   testTenantA,
 			},
 			Labels: map[string]string{
 				consts.DynamoTopologyLabelKey("zone"): "zone-a",
@@ -1358,7 +1401,7 @@ func rawSGLangWorkerService(selectorURL string) *corev1.Service {
 			Annotations: map[string]string{
 				consts.KubeAnnotationDynamoSelectionAdapter:    selectionAdapterExternalSGLang,
 				consts.KubeAnnotationDynamoSelectionServiceURL: selectorURL,
-				consts.KubeAnnotationDynamoSelectionTenantID:   "tenant-a",
+				consts.KubeAnnotationDynamoSelectionTenantID:   testTenantA,
 			},
 		},
 	}
@@ -1367,7 +1410,7 @@ func rawSGLangWorkerService(selectorURL string) *corev1.Service {
 func selectionTestWorkerMetadata(service *corev1.Service, selectorScopeKey string, adapter string) map[string]string {
 	return map[string]string{
 		selectionMetadataManagedBy:   selectionMetadataManagedByVal,
-		selectionMetadataOwnerKind:   "Service",
+		selectionMetadataOwnerKind:   testOwnerKindService,
 		selectionMetadataOwnerNS:     service.Namespace,
 		selectionMetadataOwnerName:   service.Name,
 		selectionMetadataOwnerUID:    string(service.UID),

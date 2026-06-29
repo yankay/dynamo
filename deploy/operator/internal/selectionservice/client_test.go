@@ -103,6 +103,42 @@ func TestClientUpsertsAndDeletesWorkers(t *testing.T) {
 	}
 }
 
+func TestClientNormalizesWorkerKeyDefaults(t *testing.T) {
+	var posted WorkerRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != workersPath {
+			http.NotFound(w, r)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
+			t.Fatalf("decode posted worker: %v", err)
+		}
+		if posted.ModelName != DefaultModelName || posted.TenantID != DefaultTenantID {
+			t.Fatalf("posted worker key = model:%q tenant:%q, want defaults", posted.ModelName, posted.TenantID)
+		}
+		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(WorkerRecord{
+			WorkerID:  posted.WorkerID,
+			ModelName: posted.ModelName,
+			TenantID:  posted.TenantID,
+		}); err != nil {
+			t.Fatalf("encode worker record: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithHTTPClient(server.URL, server.Client())
+	require.NoError(t, err)
+	upserted, err := client.UpsertWorker(context.Background(), WorkerRequest{
+		WorkerID:  8,
+		ModelName: " ",
+	})
+	require.NoError(t, err)
+	if upserted.ModelName != DefaultModelName || upserted.TenantID != DefaultTenantID {
+		t.Fatalf("upserted worker key = model:%q tenant:%q, want defaults", upserted.ModelName, upserted.TenantID)
+	}
+}
+
 func TestClientBuildsURLsWithBasePathAndQuery(t *testing.T) {
 	client, err := NewClientWithHTTPClient("http://selector.default.svc/api/", nil)
 	require.NoError(t, err)

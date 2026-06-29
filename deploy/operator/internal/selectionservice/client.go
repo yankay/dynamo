@@ -15,6 +15,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const workersPath = "/workers"
@@ -48,6 +50,8 @@ func NewClientWithHTTPClient(baseURL string, httpClient *http.Client) (*Client, 
 }
 
 func (c *Client) UpsertWorker(ctx context.Context, worker WorkerRequest) (WorkerRecord, error) {
+	worker.ModelName = NormalizeModelName(worker.ModelName)
+	worker.TenantID = NormalizeTenantID(worker.TenantID)
 	payload, err := json.Marshal(worker)
 	if err != nil {
 		return WorkerRecord{}, fmt.Errorf("marshal selection worker request: %w", err)
@@ -79,6 +83,8 @@ func (c *Client) ListWorkers(ctx context.Context, modelName string, tenantID str
 	return workers, nil
 }
 
+// DeleteWorker calls DELETE /workers/{worker_id}. The selection service
+// deactivates the worker and returns the record; it does not purge catalog state.
 func (c *Client) DeleteWorker(ctx context.Context, workerID uint64, missingOK bool) (WorkerRecord, error) {
 	path := fmt.Sprintf("/workers/%d", workerID)
 	respBody, err := c.doRequest(ctx, http.MethodDelete, path, nil, nil, missingOK)
@@ -118,7 +124,11 @@ func (c *Client) doRequest(ctx context.Context, method string, path string, quer
 	if err != nil {
 		return nil, fmt.Errorf("selection service %s failed: %w", operation, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.FromContext(ctx).V(1).Info("Failed to close selection service response body", "operation", operation, "error", closeErr)
+		}
+	}()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
