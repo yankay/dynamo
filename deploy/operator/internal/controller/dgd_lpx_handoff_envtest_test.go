@@ -25,6 +25,7 @@ import (
 	lpxv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo/lpx/scheduler/v1alpha1"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/testing/operatorenv"
+	grovecommon "github.com/ai-dynamo/grove/operator/api/common"
 	grovev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -103,6 +105,11 @@ func TestLPXPublicationFailureReachesDGDThroughSetup(t *testing.T) {
 	payload, err := message.Marshal()
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(buildDir, "manifest.v2.capnp.bin"), payload, 0o600))
+	replacementBuildDir := t.TempDir()
+	require.NoError(t, build.SetText(11, "replacement-test"))
+	replacementPayload, err := message.Marshal()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(replacementBuildDir, "manifest.v2.capnp.bin"), replacementPayload, 0o600))
 
 	t.Log("Start an isolated API server and register the external kinds needed only for watches")
 	config := &configv1alpha1.OperatorConfiguration{}
@@ -298,6 +305,96 @@ func TestLPXPublicationFailureReachesDGDThroughSetup(t *testing.T) {
 		}
 		assert.Equal(c, ptr.To(true), configMap.Immutable)
 	}, 20*time.Second, 50*time.Millisecond)
+
+	t.Log("Emulate Grove materializing the native scaling group and an external scaler raising it to three engines")
+	groupTemplate := pcs.Spec.Template.PodCliqueScalingGroupConfigs[0].DeepCopy()
+	groupName := grovecommon.GeneratePodCliqueScalingGroupName(
+		grovecommon.ResourceNameReplica{Name: pcs.Name, Replica: 0},
+		groupTemplate.Name,
+	)
+	group := &grovev1alpha1.PodCliqueScalingGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: groupName, Namespace: pcs.Namespace,
+			Labels:          grovecommon.GetDefaultLabelsForPodCliqueSetManagedResources(pcs.Name),
+			Annotations:     groupTemplate.Annotations,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(pcs, grovev1alpha1.SchemeGroupVersion.WithKind("PodCliqueSet"))},
+		},
+		Spec: grovev1alpha1.PodCliqueScalingGroupSpec{
+			Replicas: 3, MinAvailable: groupTemplate.MinAvailable, CliqueNames: groupTemplate.CliqueNames,
+		},
+	}
+	group.Labels[grovecommon.LabelPartOfKey] = pcs.Name
+	group.Labels[grovecommon.LabelPodCliqueSetReplicaIndex] = "0"
+	require.NoError(t, env.Client().Create(t.Context(), group))
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		if !assert.NoError(c, env.Client().Get(t.Context(), client.ObjectKeyFromObject(child), child)) {
+			return
+		}
+		assert.Equal(c, ptr.To(int32(3)), child.Status.RetainedReplicas)
+	}, 20*time.Second, 50*time.Millisecond)
+
+	t.Log("Change immutable LPX workload intent and observe the old PCS retire only after the external count is durable")
+	oldPCSUID := pcs.UID
+	require.NoError(t, retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := env.Client().Get(t.Context(), key, source); err != nil {
+			return err
+		}
+		source.Spec.Components[0].LPX.BuildID = (&url.URL{Scheme: "file", Path: replacementBuildDir}).String()
+		return env.Client().Update(t.Context(), source)
+	}))
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		current := &v1alpha1.LPXGraphDeployment{}
+		if !assert.NoError(c, env.Client().Get(t.Context(), client.ObjectKeyFromObject(child), current)) {
+			return
+		}
+		assert.Equal(c, ptr.To(int32(3)), current.Status.RetainedReplicas)
+		assert.Greater(c, current.Generation, child.Generation)
+	}, 20*time.Second, 50*time.Millisecond)
+	require.Eventually(t, func() bool {
+		current := &grovev1alpha1.PodCliqueSet{}
+		err := env.Client().Get(t.Context(), client.ObjectKeyFromObject(pcs), current)
+		return apierrors.IsNotFound(err)
+	}, 20*time.Second, 50*time.Millisecond)
+
+	t.Log("Emulate Grove background cleanup for dependents of the deleted PCS")
+	require.NoError(t, env.Client().Delete(t.Context(), group))
+	requests = &lpxv1alpha1.LPUPipelineRequestList{}
+	require.NoError(t, env.Client().List(t.Context(), requests, client.InNamespace(env.Namespace())))
+	for index := range requests.Items {
+		if metav1.IsControlledBy(&requests.Items[index], pcs) {
+			require.NoError(t, env.Client().Delete(t.Context(), &requests.Items[index]))
+		}
+	}
+
+	t.Log("Recreate the same-name PCS from retained state and publish one scheduler request per preserved engine")
+	var replacementPCSUID types.UID
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		replacement := &grovev1alpha1.PodCliqueSet{}
+		if !assert.NoError(c, env.Client().Get(t.Context(), client.ObjectKeyFromObject(pcs), replacement)) {
+			return
+		}
+		assert.NotEqual(c, oldPCSUID, replacement.UID)
+		if assert.Len(c, replacement.Spec.Template.PodCliqueScalingGroupConfigs, 1) {
+			assert.Equal(c, ptr.To(int32(3)), replacement.Spec.Template.PodCliqueScalingGroupConfigs[0].Replicas)
+		}
+		replacementPCSUID = replacement.UID
+	}, 20*time.Second, 50*time.Millisecond)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		published := &lpxv1alpha1.LPUPipelineRequestList{}
+		if !assert.NoError(c, env.Client().List(t.Context(), published, client.InNamespace(env.Namespace()))) {
+			return
+		}
+		if !assert.Len(c, published.Items, 3) {
+			return
+		}
+		for index := range published.Items {
+			owner := metav1.GetControllerOf(&published.Items[index])
+			if assert.NotNil(c, owner) {
+				assert.Equal(c, replacementPCSUID, owner.UID)
+				assert.Equal(c, pcs.Name, owner.Name)
+			}
+		}
+	}, 20*time.Second, 50*time.Millisecond)
 }
 
 func TestLPXGraphDeploymentAPIHandoff(t *testing.T) {
@@ -330,6 +427,7 @@ func TestLPXGraphDeploymentAPIHandoff(t *testing.T) {
 
 	t.Log("Project the observed download payload and its actionable failure")
 	child.Status.ObservedGeneration = child.Generation
+	child.Status.RetainedReplicas = ptr.To(int32(3))
 	child.Status.ModelDownload = &v1beta1.ModelDownloadStatus{Builds: []string{"downloaded-build"}}
 	child.Status.Conditions = []metav1.Condition{{Type: "Failed", Status: metav1.ConditionTrue, ObservedGeneration: child.Generation,
 		LastTransitionTime: metav1.Now(), Reason: "PublicationDenied", Message: "Check the namespace quota"}}
@@ -363,6 +461,7 @@ func TestLPXGraphDeploymentAPIHandoff(t *testing.T) {
 	require.NotEqual(t, child.Spec.InputRevision, updated.Spec.InputRevision)
 	require.NoError(t, dynamo.ValidateLPXSource(updated, source))
 	require.Equal(t, child.Status.ObservedGeneration, updated.Status.ObservedGeneration)
+	require.Equal(t, ptr.To(int32(3)), updated.Status.RetainedReplicas)
 	result = &ReconcileResult{State: v1beta1.DGDStateSuccessful}
 	projectLPXChildStatus(source, updated, result, &projected)
 	require.Equal(t, v1beta1.DGDStatePending, result.State)
@@ -394,4 +493,10 @@ func TestLPXGraphDeploymentAPIHandoff(t *testing.T) {
 	require.NoError(t, env.Client().Status().Update(t.Context(), stored))
 	require.NoError(t, env.Client().Get(t.Context(), client.ObjectKeyFromObject(stored), stored))
 	require.Equal(t, 0.75, *stored.Status.Placement.Score)
+
+	t.Log("Retained zero replicas survives the real status schema without defaulting to an absent value")
+	stored.Status.RetainedReplicas = ptr.To(int32(0))
+	require.NoError(t, env.Client().Status().Update(t.Context(), stored))
+	require.NoError(t, env.Client().Get(t.Context(), client.ObjectKeyFromObject(stored), stored))
+	require.Equal(t, ptr.To(int32(0)), stored.Status.RetainedReplicas)
 }
