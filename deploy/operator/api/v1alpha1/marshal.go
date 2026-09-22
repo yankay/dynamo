@@ -20,94 +20,46 @@ package v1alpha1
 import (
 	"bytes"
 	"encoding/json"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
-type dynamoGraphDeploymentForMarshal DynamoGraphDeployment
+// MarshalJSON preserves sparse container fields, including after v1beta1 storage
+// conversion. A value receiver also normalizes ExtraPodSpec values in maps and
+// recursively marshaled DGD/DCD specs without root-level traversal.
+func (e ExtraPodSpec) MarshalJSON() ([]byte, error) {
+	// Shadow PodSpec.Containers: its required field otherwise emits null, which
+	// the CRD schema rejects. The alias avoids inheriting PodSpec marshal methods.
+	type PodSpecAlias corev1.PodSpec
+	aux := struct {
+		*PodSpecAlias `json:",inline"`
+		Containers    []corev1.Container `json:"containers,omitempty"`
+		MainContainer *corev1.Container  `json:"mainContainer,omitempty"`
+	}{
+		MainContainer: e.MainContainer,
+	}
+	if e.PodSpec != nil {
+		a := PodSpecAlias(*e.PodSpec)
+		aux.PodSpecAlias = &a
+		aux.Containers = e.PodSpec.Containers
+	}
 
-// MarshalJSON serializes a DGD and removes native-container zero-value fields
-// introduced by the typed v1beta1-to-v1alpha1 conversion path.
-// Normalization stays at the root so ExtraPodSpec's historical JSON, which
-// participates in the legacy v1alpha1 worker hash, remains unchanged.
-func (d DynamoGraphDeployment) MarshalJSON() ([]byte, error) {
-	raw, err := json.Marshal(dynamoGraphDeploymentForMarshal(d))
+	// Normalize serialized fields without mutating the caller-owned pod or containers.
+	raw, err := json.Marshal(aux)
 	if err != nil {
 		return nil, err
 	}
 
-	return normalizeDynamoGraphDeploymentJSON(raw)
-}
-
-type dynamoComponentDeploymentForMarshal DynamoComponentDeployment
-
-// MarshalJSON serializes a DCD and removes native-container zero-value fields
-// introduced by the typed v1beta1-to-v1alpha1 conversion path.
-// See DynamoGraphDeployment.MarshalJSON for why normalization is root-scoped.
-func (d DynamoComponentDeployment) MarshalJSON() ([]byte, error) {
-	raw, err := json.Marshal(dynamoComponentDeploymentForMarshal(d))
-	if err != nil {
-		return nil, err
-	}
-
-	return normalizeDynamoComponentDeploymentJSON(raw)
-}
-
-func normalizeDynamoGraphDeploymentJSON(raw []byte) ([]byte, error) {
-	// Decode the DGD into a mutable root before normalizing its service containers.
-	root, err := decodeV1alpha1JSONObject(raw)
-	if err != nil {
-		return nil, err
-	}
-
-	// Limit normalization to service specs so unrelated DGD fields retain their encoding.
-	if spec, ok := root["spec"].(map[string]any); ok {
-		if services, ok := spec["services"].(map[string]any); ok {
-			for _, service := range services {
-				if serviceSpec, ok := service.(map[string]any); ok {
-					normalizeV1alpha1ExtraPodSpecJSON(serviceSpec)
-				}
-			}
-		}
-	}
-
-	return json.Marshal(root)
-}
-
-func normalizeDynamoComponentDeploymentJSON(raw []byte) ([]byte, error) {
-	// Decode the DCD into a mutable root before normalizing its component container.
-	root, err := decodeV1alpha1JSONObject(raw)
-	if err != nil {
-		return nil, err
-	}
-
-	// Limit normalization to the component spec so unrelated DCD fields retain their encoding.
-	if spec, ok := root["spec"].(map[string]any); ok {
-		normalizeV1alpha1ExtraPodSpecJSON(spec)
-	}
-
-	return json.Marshal(root)
-}
-
-func decodeV1alpha1JSONObject(raw []byte) (map[string]any, error) {
-	// Preserve JSON numbers while configuring the generic object decoder.
+	// PodSpec contains int64 fields that must not lose precision through float64.
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
-
-	// Decode the root object for targeted container normalization.
-	var root map[string]any
-	if err := decoder.Decode(&root); err != nil {
+	var pod map[string]any
+	if err := decoder.Decode(&pod); err != nil {
 		return nil, err
-	}
-	return root, nil
-}
-
-func normalizeV1alpha1ExtraPodSpecJSON(component map[string]any) {
-	extraPodSpec, ok := component["extraPodSpec"].(map[string]any)
-	if !ok {
-		return
 	}
 
 	// MainContainer has no required name and conversion clears its synthetic one.
-	if mainContainer, ok := extraPodSpec["mainContainer"].(map[string]any); ok {
+	if mainContainer, ok := pod["mainContainer"].(map[string]any); ok {
 		if name, ok := mainContainer["name"].(string); ok && name == "" {
 			delete(mainContainer, "name")
 		}
@@ -116,7 +68,7 @@ func normalizeV1alpha1ExtraPodSpecJSON(component map[string]any) {
 
 	// Native container lists also materialize zero ResourceRequirements as {}.
 	for _, field := range []string{"containers", "initContainers", "ephemeralContainers"} {
-		containers, ok := extraPodSpec[field].([]any)
+		containers, ok := pod[field].([]any)
 		if !ok {
 			continue
 		}
@@ -126,6 +78,8 @@ func normalizeV1alpha1ExtraPodSpecJSON(component map[string]any) {
 			}
 		}
 	}
+
+	return json.Marshal(pod)
 }
 
 func removeEmptyContainerResourcesJSON(container map[string]any) {

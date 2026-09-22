@@ -22,13 +22,14 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	corev1 "k8s.io/api/core/v1"
+	"github.com/stretchr/testify/require"
 	"sigs.k8s.io/controller-runtime/pkg/conversion"
 
 	v1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
 )
 
 func TestV1alpha1WireShapeSurvivesV1beta1StorageMigration(t *testing.T) {
+	const podJSON = `{"mainContainer":{"image":"busybox"},"containers":[{"name":"empty-sidecar"},{"name":"resource-sidecar","resources":{"claims":[{"name":"sidecar-gpu"}]}}],"initContainers":[{"name":"init"}],"ephemeralContainers":[{"name":"debug"}]}`
 	tests := []struct {
 		name       string
 		rawAlpha   string
@@ -53,6 +54,22 @@ func TestV1alpha1WireShapeSurvivesV1beta1StorageMigration(t *testing.T) {
 			storedHub:  &v1beta1.DynamoComponentDeployment{},
 			afterAlpha: &DynamoComponentDeployment{},
 		},
+		{
+			name:       "DynamoGraphDeployment with all container lists and multiple services",
+			rawAlpha:   `{"spec":{"services":{"frontend":{"extraPodSpec":` + podJSON + `},"worker":{"extraPodSpec":` + podJSON + `}}}}`,
+			alpha:      &DynamoGraphDeployment{},
+			hub:        &v1beta1.DynamoGraphDeployment{},
+			storedHub:  &v1beta1.DynamoGraphDeployment{},
+			afterAlpha: &DynamoGraphDeployment{},
+		},
+		{
+			name:       "DynamoComponentDeployment with all container lists",
+			rawAlpha:   `{"spec":{"extraPodSpec":` + podJSON + `}}`,
+			alpha:      &DynamoComponentDeployment{},
+			hub:        &v1beta1.DynamoComponentDeployment{},
+			storedHub:  &v1beta1.DynamoComponentDeployment{},
+			afterAlpha: &DynamoComponentDeployment{},
+		},
 	}
 
 	for _, tt := range tests {
@@ -65,6 +82,13 @@ func TestV1alpha1WireShapeSurvivesV1beta1StorageMigration(t *testing.T) {
 			if err := json.Unmarshal([]byte(tt.rawAlpha), tt.alpha); err != nil {
 				t.Fatalf("unmarshal typed v1alpha1 object: %v", err)
 			}
+
+			t.Log("Verify recursive marshaling preserves the original sparse spec before conversion")
+			directJSON, err := json.Marshal(tt.alpha)
+			require.NoError(t, err)
+			var direct map[string]any
+			require.NoError(t, json.Unmarshal(directJSON, &direct))
+			require.Equal(t, before["spec"], direct["spec"])
 
 			t.Log("Convert the object to v1beta1 and round-trip it through storage JSON")
 			if err := tt.alpha.ConvertTo(tt.hub); err != nil {
@@ -96,70 +120,5 @@ func TestV1alpha1WireShapeSurvivesV1beta1StorageMigration(t *testing.T) {
 				t.Fatalf("v1alpha1 spec changed across v1beta1 storage migration (-want +got):\n%s", diff)
 			}
 		})
-	}
-}
-
-func TestDynamoGraphDeploymentMarshalNormalizesExtraPodSpecContainers(t *testing.T) {
-	t.Log("Build a DGD containing empty and non-empty native container resources")
-	dgd := DynamoGraphDeployment{
-		Spec: DynamoGraphDeploymentSpec{
-			Services: map[string]*DynamoComponentDeploymentSharedSpec{
-				"frontend": {
-					ExtraPodSpec: &ExtraPodSpec{
-						PodSpec: &corev1.PodSpec{
-							Containers: []corev1.Container{
-								{Name: "empty-sidecar"},
-								{Name: "resource-sidecar", Resources: corev1.ResourceRequirements{Claims: []corev1.ResourceClaim{{Name: "sidecar-gpu"}}}},
-							},
-							InitContainers: []corev1.Container{{Name: "init"}},
-							EphemeralContainers: []corev1.EphemeralContainer{{
-								EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug"},
-							}},
-						},
-						MainContainer: &corev1.Container{Image: "busybox"},
-					},
-				},
-			},
-		},
-	}
-
-	t.Log("Marshal through the public v1alpha1 root object")
-	raw, err := json.Marshal(dgd)
-	if err != nil {
-		t.Fatalf("marshal DGD: %v", err)
-	}
-	var root map[string]any
-	if err := json.Unmarshal(raw, &root); err != nil {
-		t.Fatalf("unmarshal DGD JSON: %v", err)
-	}
-	extraPodSpec := root["spec"].(map[string]any)["services"].(map[string]any)["frontend"].(map[string]any)["extraPodSpec"].(map[string]any)
-
-	t.Log("Verify the main container omits its empty synthetic fields")
-	mainContainer := extraPodSpec["mainContainer"].(map[string]any)
-	if _, ok := mainContainer["name"]; ok {
-		t.Fatalf("mainContainer.name was not omitted: %v", mainContainer)
-	}
-	if _, ok := mainContainer["resources"]; ok {
-		t.Fatalf("mainContainer.resources was not omitted: %v", mainContainer)
-	}
-
-	t.Log("Verify every PodSpec container list omits empty resources")
-	containers := extraPodSpec["containers"].([]any)
-	if _, ok := containers[0].(map[string]any)["resources"]; ok {
-		t.Fatalf("containers[0].resources was not omitted: %v", containers[0])
-	}
-	initContainers := extraPodSpec["initContainers"].([]any)
-	if _, ok := initContainers[0].(map[string]any)["resources"]; ok {
-		t.Fatalf("initContainers[0].resources was not omitted: %v", initContainers[0])
-	}
-	ephemeralContainers := extraPodSpec["ephemeralContainers"].([]any)
-	if _, ok := ephemeralContainers[0].(map[string]any)["resources"]; ok {
-		t.Fatalf("ephemeralContainers[0].resources was not omitted: %v", ephemeralContainers[0])
-	}
-
-	t.Log("Verify non-empty resources remain present")
-	resources, ok := containers[1].(map[string]any)["resources"].(map[string]any)
-	if !ok || len(resources) == 0 {
-		t.Fatalf("containers[1].resources = %v, want non-empty", containers[1])
 	}
 }

@@ -284,10 +284,11 @@ func TestGroveRenderDeploymentWorkerHashSuffix(t *testing.T) {
 }
 
 func TestShouldTriggerRollingUpdate(t *testing.T) {
+	t.Log("Define rollout decisions for absent, legacy, matching, and stale hashes")
 	tests := []struct {
 		name         string
 		services     map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec
-		existingHash string // empty means no annotation, "compute" means compute from services
+		existingHash string // empty means no annotation, "compute" means current v2, "legacy" means v1 only
 		expected     bool
 	}{
 		{
@@ -323,7 +324,7 @@ func TestShouldTriggerRollingUpdate(t *testing.T) {
 					},
 				},
 			},
-			existingHash: "legacy-compute",
+			existingHash: "legacy",
 			expected:     false,
 		},
 		{
@@ -356,22 +357,24 @@ func TestShouldTriggerRollingUpdate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Log("Build the stored hash state with an opaque legacy suffix")
 			dgd := createTestDGD("test-dgd", tt.services)
+			const legacyHash = "legacy01"
 
 			if tt.existingHash == "compute" {
-				hash := legacyDGDWorkersSpecHash(t, dgd)
 				dgd.Annotations = map[string]string{
-					consts.AnnotationCurrentWorkerHash:   hash,
+					consts.AnnotationCurrentWorkerHash:   legacyHash,
 					consts.AnnotationCurrentWorkerHashV2: betaDGDWorkersSpecHash(t, dgd),
 				}
-			} else if tt.existingHash == "legacy-compute" {
+			} else if tt.existingHash == "legacy" {
 				dgd.Annotations = map[string]string{
-					consts.AnnotationCurrentWorkerHash: legacyDGDWorkersSpecHash(t, dgd),
+					consts.AnnotationCurrentWorkerHash: legacyHash,
 				}
 			} else if tt.existingHash != "" {
 				dgd.Annotations = map[string]string{consts.AnnotationCurrentWorkerHashV2: tt.existingHash}
 			}
 
+			t.Log("Verify whether the desired spec requires a rollout")
 			r := createTestReconcilerWithStatus(dgd)
 			result, err := r.shouldTriggerRollingUpdate(dgd)
 			require.NoError(t, err)
@@ -384,19 +387,21 @@ func TestShouldTriggerRollingUpdate(t *testing.T) {
 }
 
 func TestShouldTriggerRollingUpdate_IgnoresReplicaChanges(t *testing.T) {
+	t.Log("Record an opaque legacy suffix and the current v2 hash")
+	const legacyHash = "legacy01"
 	dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 		"worker": {
 			ComponentType: consts.ComponentTypeWorker,
 			Envs:          []corev1.EnvVar{{Name: "FOO", Value: "bar"}},
 		},
 	})
-	legacyHash := legacyDGDWorkersSpecHash(t, dgd)
 	v2Hash := betaDGDWorkersSpecHash(t, dgd)
 	dgd.Annotations = map[string]string{
 		consts.AnnotationCurrentWorkerHash:   legacyHash,
 		consts.AnnotationCurrentWorkerHashV2: v2Hash,
 	}
 
+	t.Log("Scale replicas without changing generation hashes or triggering a rollout")
 	dgd.Spec.Components[0].Replicas = ptr.To(int32(10))
 
 	r := createTestReconcilerWithStatus(dgd)
@@ -468,6 +473,7 @@ func TestShouldTriggerRollingUpdate_UsesResolvedRuntimeVersion(t *testing.T) {
 }
 
 func TestCanonicalWorkerHashLifecycle_FirstDeploySpecChangeAndCompletion(t *testing.T) {
+	t.Log("Initialize a new deployment with only its canonical v2 hash")
 	dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 		"worker": {
 			ComponentType: consts.ComponentTypeWorker,
@@ -480,32 +486,23 @@ func TestCanonicalWorkerHashLifecycle_FirstDeploySpecChangeAndCompletion(t *test
 		},
 	})
 
-	// Create reconciler with DGD already in the fake client (simulates existing resource)
 	r := createTestReconcilerWithStatus(dgd)
 	ctx := context.Background()
-
-	// Initialize the hash
 	err := r.initializeWorkerHashIfNeeded(ctx, dgd)
 	require.NoError(t, err)
-
-	// Verify only the v2 hash was set.
 	hash := currentWorkerHashV2(dgd)
 	assert.NotEmpty(t, hash, "Hash should be set after initialization")
 	assert.NotContains(t, dgd.Annotations, consts.AnnotationCurrentWorkerHash)
-
-	// Fresh deployments store one canonical v2 hash.
 	expectedV2Hash := betaDGDWorkersSpecHash(t, dgd)
 	assert.Equal(t, expectedV2Hash, hash)
 
-	// A later worker change rolls directly from one canonical v2 generation to the next.
+	t.Log("Change the worker spec and verify the rollout targets its new v2 generation")
 	dgd.Spec.Components[0].PodTemplate.Spec.Containers[0].Env = append(
 		dgd.Spec.Components[0].PodTemplate.Spec.Containers[0].Env,
 		corev1.EnvVar{Name: "NEW_WORKER_SETTING", Value: "true"},
 	)
 	newV2Hash := betaDGDWorkersSpecHash(t, dgd)
-	newLegacyHash := legacyDGDWorkersSpecHash(t, dgd)
 	require.NotEqual(t, expectedV2Hash, newV2Hash)
-	require.NotEqual(t, newLegacyHash, newV2Hash)
 
 	trigger, err := r.shouldTriggerRollingUpdate(dgd)
 	require.NoError(t, err)
@@ -514,8 +511,8 @@ func TestCanonicalWorkerHashLifecycle_FirstDeploySpecChangeAndCompletion(t *test
 	rollingCtx, err := r.buildRollingUpdateContext(ctx, dgd)
 	require.NoError(t, err)
 	require.Equal(t, newV2Hash, rollingCtx.NewWorkerHash)
-	require.NotEqual(t, newLegacyHash, rollingCtx.NewWorkerHash)
 
+	t.Log("Complete the rollout and verify only the new v2 hash remains")
 	require.NoError(t, r.completeRollingUpdate(ctx, dgd, &dgd.Status, newV2Hash))
 	require.NotContains(t, dgd.Annotations, consts.AnnotationCurrentWorkerHash)
 	require.Equal(t, newV2Hash, dgd.Annotations[consts.AnnotationCurrentWorkerHashV2])
@@ -635,40 +632,39 @@ func TestActiveWorkerHashCandidatesV2Only(t *testing.T) {
 }
 
 func TestInitializeWorkerHashIfNeeded_PreservesLegacyAlphaHash(t *testing.T) {
+	t.Log("Restore a stored v1 hash from before ExtraPodSpec wire-shape normalization")
+	const legacyHash = "0c322ce0"
 	alpha := &nvidiacomv1alpha1.DynamoGraphDeployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-dgd",
 			Namespace: "default",
 			Annotations: map[string]string{
-				consts.AnnotationCurrentWorkerHash: "old-alpha-hash",
+				consts.AnnotationCurrentWorkerHash: legacyHash,
 			},
 		},
 		Spec: nvidiacomv1alpha1.DynamoGraphDeploymentSpec{
 			Services: map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 				"worker": {
 					ComponentType: consts.ComponentTypeWorker,
-					Envs:          []corev1.EnvVar{{Name: "FOO", Value: "bar"}},
-					Resources: &nvidiacomv1alpha1.Resources{
-						Requests: &nvidiacomv1alpha1.ResourceItem{CPU: "1"},
+					ExtraPodSpec: &nvidiacomv1alpha1.ExtraPodSpec{
+						MainContainer: &corev1.Container{Name: consts.MainContainerName},
 					},
 				},
 			},
 		},
 	}
+
+	t.Log("Verify conversion preserves the stored legacy hash opaquely")
 	dgd := &nvidiacomv1beta1.DynamoGraphDeployment{}
 	require.NoError(t, alpha.ConvertTo(dgd))
-	legacyHash := legacyDGDWorkersSpecHash(t, dgd)
+	require.Equal(t, legacyHash, dgd.Annotations[consts.AnnotationCurrentWorkerHash])
 	v2Hash := betaDGDWorkersSpecHash(t, dgd)
 	require.NotEqual(t, legacyHash, v2Hash)
-	if dgd.Annotations == nil {
-		dgd.Annotations = map[string]string{}
-	}
-	dgd.Annotations[consts.AnnotationCurrentWorkerHash] = legacyHash
 
+	t.Log("Initialize v2 while keeping the existing generation active without a rollout")
 	r := createTestReconcilerWithStatus(dgd)
 	err := r.initializeWorkerHashIfNeeded(context.Background(), dgd)
 	require.NoError(t, err)
-
 	assert.Equal(t, legacyHash, currentWorkerHash(dgd))
 	assert.Equal(t, v2Hash, dgd.Annotations[consts.AnnotationCurrentWorkerHashV2])
 	trigger, err := r.shouldTriggerRollingUpdate(dgd)
@@ -683,12 +679,14 @@ func TestInitializeWorkerHashIfNeeded_PreservesLegacyAlphaHash(t *testing.T) {
 }
 
 func TestLegacyAlphaHashCompatibility_NoOpUpgradeUsesExistingWorkerGeneration(t *testing.T) {
+	t.Log("Build an alpha DGD with an opaque stored worker suffix")
+	const legacyHash = "legacy01"
 	alpha := &nvidiacomv1alpha1.DynamoGraphDeployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "qwen",
 			Namespace: "default",
 			Annotations: map[string]string{
-				consts.AnnotationCurrentWorkerHash: "old-alpha-hash",
+				consts.AnnotationCurrentWorkerHash: legacyHash,
 			},
 		},
 		Spec: nvidiacomv1alpha1.DynamoGraphDeploymentSpec{
@@ -705,19 +703,18 @@ func TestLegacyAlphaHashCompatibility_NoOpUpgradeUsesExistingWorkerGeneration(t 
 			},
 		},
 	}
+
+	t.Log("Convert to the hub and record v2 without replacing the legacy suffix")
 	dgd := &nvidiacomv1beta1.DynamoGraphDeployment{}
 	require.NoError(t, alpha.ConvertTo(dgd))
-	legacyHash := legacyDGDWorkersSpecHash(t, dgd)
+	require.Equal(t, legacyHash, dgd.Annotations[consts.AnnotationCurrentWorkerHash])
 	v2Hash := betaDGDWorkersSpecHash(t, dgd)
 	require.NotEqual(t, legacyHash, v2Hash)
-	if dgd.Annotations == nil {
-		dgd.Annotations = map[string]string{}
-	}
-	dgd.Annotations[consts.AnnotationCurrentWorkerHash] = legacyHash
 
 	r := createTestReconcilerWithStatus(dgd)
 	require.NoError(t, r.initializeWorkerHashIfNeeded(context.Background(), dgd))
 
+	t.Log("Verify the upgrade keeps the existing worker generation without a rollout")
 	trigger, err := r.shouldTriggerRollingUpdate(dgd)
 	require.NoError(t, err)
 	require.False(t, trigger)
@@ -734,6 +731,8 @@ func TestLegacyAlphaHashCompatibility_NoOpUpgradeUsesExistingWorkerGeneration(t 
 }
 
 func TestLegacyAlphaHashCompatibility_WorkerSpecChangeUsesNewV2Generation(t *testing.T) {
+	t.Log("Initialize v2 for a worker DGD while preserving its stored legacy suffix")
+	const legacyHash = "legacy01"
 	dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 		"worker": {
 			ComponentType: consts.ComponentTypeWorker,
@@ -743,7 +742,6 @@ func TestLegacyAlphaHashCompatibility_WorkerSpecChangeUsesNewV2Generation(t *tes
 			},
 		},
 	})
-	legacyHash := legacyDGDWorkersSpecHash(t, dgd)
 	v2Hash := betaDGDWorkersSpecHash(t, dgd)
 	require.NotEqual(t, legacyHash, v2Hash)
 	if dgd.Annotations == nil {
@@ -756,17 +754,17 @@ func TestLegacyAlphaHashCompatibility_WorkerSpecChangeUsesNewV2Generation(t *tes
 	require.Equal(t, legacyHash, dgd.Annotations[consts.AnnotationCurrentWorkerHash])
 	require.Equal(t, v2Hash, dgd.Annotations[consts.AnnotationCurrentWorkerHashV2])
 
+	t.Log("Change the worker spec and verify its desired v2 hash changes")
 	dgd.Spec.Components[0].PodTemplate.Spec.Containers[0].Env = append(
 		dgd.Spec.Components[0].PodTemplate.Spec.Containers[0].Env,
 		corev1.EnvVar{Name: "NEW_WORKER_SETTING", Value: "true"},
 	)
 	newV2Hash := betaDGDWorkersSpecHash(t, dgd)
-	newLegacyHash := legacyDGDWorkersSpecHash(t, dgd)
 	require.NotEqual(t, v2Hash, newV2Hash)
-	require.NotEqual(t, legacyHash, newLegacyHash)
 
+	t.Log("Verify rollout targets v2 while preserving the stored legacy suffix")
 	require.NoError(t, r.migrateCurrentWorkerHashIfNeeded(context.Background(), dgd))
-
+	require.Equal(t, legacyHash, dgd.Annotations[consts.AnnotationCurrentWorkerHash])
 	trigger, err := r.shouldTriggerRollingUpdate(dgd)
 	require.NoError(t, err)
 	require.True(t, trigger)
@@ -774,10 +772,12 @@ func TestLegacyAlphaHashCompatibility_WorkerSpecChangeUsesNewV2Generation(t *tes
 	rollingCtx, err := r.buildRollingUpdateContext(context.Background(), dgd)
 	require.NoError(t, err)
 	require.Equal(t, newV2Hash, rollingCtx.NewWorkerHash)
-	require.NotEqual(t, newLegacyHash, rollingCtx.NewWorkerHash)
+	require.NotEqual(t, legacyHash, rollingCtx.NewWorkerHash)
 }
 
 func TestLegacyAlphaHashCompatibility_V2OnlyChangeUsesNewV2Generation(t *testing.T) {
+	t.Log("Build a worker DGD with both an opaque legacy suffix and a v2 baseline")
+	const legacyHash = "legacy01"
 	dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 		"worker": {
 			ComponentType: consts.ComponentTypeWorker,
@@ -785,19 +785,17 @@ func TestLegacyAlphaHashCompatibility_V2OnlyChangeUsesNewV2Generation(t *testing
 		},
 	})
 	dgd.Spec.BackendFramework = "vllm"
-	legacyHash := legacyDGDWorkersSpecHash(t, dgd)
 	v2Hash := betaDGDWorkersSpecHash(t, dgd)
 	dgd.Annotations = map[string]string{
 		consts.AnnotationCurrentWorkerHash:   legacyHash,
 		consts.AnnotationCurrentWorkerHashV2: v2Hash,
 	}
 
+	t.Log("Change the backend and target a new v2 generation without advancing stored hashes")
 	r := createTestReconcilerWithStatus(dgd)
 	dgd.Spec.BackendFramework = "sglang"
 
-	newLegacyHash := legacyDGDWorkersSpecHash(t, dgd)
 	newV2Hash := betaDGDWorkersSpecHash(t, dgd)
-	require.Equal(t, legacyHash, newLegacyHash)
 	require.NotEqual(t, v2Hash, newV2Hash)
 
 	require.NoError(t, r.migrateCurrentWorkerHashIfNeeded(context.Background(), dgd))
@@ -811,14 +809,17 @@ func TestLegacyAlphaHashCompatibility_V2OnlyChangeUsesNewV2Generation(t *testing
 	rollingCtx, err := r.buildRollingUpdateContext(context.Background(), dgd)
 	require.NoError(t, err)
 	require.Equal(t, newV2Hash, rollingCtx.NewWorkerHash)
-	require.NotEqual(t, newLegacyHash, rollingCtx.NewWorkerHash)
+	require.NotEqual(t, legacyHash, rollingCtx.NewWorkerHash)
 
+	t.Log("Complete the rollout and remove the legacy annotation")
 	require.NoError(t, r.completeRollingUpdate(context.Background(), dgd, &dgd.Status, newV2Hash))
 	require.Empty(t, dgd.Annotations[consts.AnnotationCurrentWorkerHash])
 	require.Equal(t, newV2Hash, dgd.Annotations[consts.AnnotationCurrentWorkerHashV2])
 }
 
 func TestUnsupportedPathwayMigratesV1OnlyAndKeepsV2OnlyGeneration(t *testing.T) {
+	t.Log("Record v2 for a multinode worker without rolling its legacy generation")
+	const legacyHash = "legacy01"
 	dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 		"worker": {
 			ComponentType: consts.ComponentTypeWorker,
@@ -827,7 +828,6 @@ func TestUnsupportedPathwayMigratesV1OnlyAndKeepsV2OnlyGeneration(t *testing.T) 
 		},
 	})
 	dgd.Spec.BackendFramework = "vllm"
-	legacyHash := legacyDGDWorkersSpecHash(t, dgd)
 	v2Hash := betaDGDWorkersSpecHash(t, dgd)
 	dgd.Annotations = map[string]string{
 		consts.AnnotationCurrentWorkerHash: legacyHash,
@@ -844,17 +844,17 @@ func TestUnsupportedPathwayMigratesV1OnlyAndKeepsV2OnlyGeneration(t *testing.T) 
 	require.NoError(t, err)
 	require.False(t, trigger)
 
+	t.Log("Change the backend while preserving both stored generation annotations")
 	dgd.Spec.BackendFramework = "sglang"
 
-	newLegacyHash := legacyDGDWorkersSpecHash(t, dgd)
 	newV2Hash := betaDGDWorkersSpecHash(t, dgd)
-	require.Equal(t, legacyHash, newLegacyHash)
 	require.NotEqual(t, v2Hash, newV2Hash)
 
 	require.NoError(t, r.migrateCurrentWorkerHashIfNeeded(context.Background(), dgd))
 	require.Equal(t, legacyHash, dgd.Annotations[consts.AnnotationCurrentWorkerHash])
 	require.Equal(t, v2Hash, dgd.Annotations[consts.AnnotationCurrentWorkerHashV2])
 
+	t.Log("Verify the unsupported pathway advances directly to the desired v2 generation")
 	desired, err := desiredWorkerHashes(dgd)
 	require.NoError(t, err)
 	completed := r.workerHashesForUnsupportedPathway(dgd, desired)
@@ -2278,12 +2278,13 @@ func TestComponentWorkloadsReconciler_GetExistingRestartAnnotationsDCD(t *testin
 	})
 
 	t.Run("worker DCD with v2 hash suffix - finds annotation", func(t *testing.T) {
+		t.Log("Build a DGD with both hashes and a restart annotation on its v2 worker")
+		const legacyHash = "legacy01"
 		dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 			"worker": {
 				ComponentType: consts.ComponentTypeWorker,
 			},
 		})
-		legacyHash := legacyDGDWorkersSpecHash(t, dgd)
 		v2Hash := betaDGDWorkersSpecHash(t, dgd)
 		dgd.Annotations = map[string]string{
 			consts.AnnotationCurrentWorkerHash:   legacyHash,
@@ -2304,6 +2305,7 @@ func TestComponentWorkloadsReconciler_GetExistingRestartAnnotationsDCD(t *testin
 			},
 		})
 
+		t.Log("Verify the restart annotation is found through the v2 suffix")
 		r := createTestReconcilerWithStatus(dgd, withObjects(workerDCD))
 		ctx := context.Background()
 
@@ -2387,12 +2389,13 @@ func TestComponentWorkloadsReconciler_GetExistingRestartAnnotationsDCD(t *testin
 
 func TestComponentRestartProgressResolver_CheckComponentFullyUpdated(t *testing.T) {
 	t.Run("worker with hash suffix - finds DCD", func(t *testing.T) {
+		t.Log("Build a DGD and a ready worker with an opaque legacy suffix")
+		const workerHash = "legacy01"
 		dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 			"worker": {
 				ComponentType: consts.ComponentTypeWorker,
 			},
 		})
-		workerHash := legacyDGDWorkersSpecHash(t, dgd)
 		dgd.Annotations = map[string]string{
 			consts.AnnotationCurrentWorkerHash: workerHash,
 		}
@@ -2414,6 +2417,7 @@ func TestComponentRestartProgressResolver_CheckComponentFullyUpdated(t *testing.
 			},
 		})
 
+		t.Log("Verify readiness lookup finds the existing legacy generation")
 		r := createTestReconcilerWithStatus(dgd, withObjects(workerDCD))
 		ctx := context.Background()
 
@@ -2423,12 +2427,13 @@ func TestComponentRestartProgressResolver_CheckComponentFullyUpdated(t *testing.
 	})
 
 	t.Run("worker with v2 hash suffix - finds DCD", func(t *testing.T) {
+		t.Log("Build a DGD with both hashes and a ready v2 worker")
+		const legacyHash = "legacy01"
 		dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 			"worker": {
 				ComponentType: consts.ComponentTypeWorker,
 			},
 		})
-		legacyHash := legacyDGDWorkersSpecHash(t, dgd)
 		v2Hash := betaDGDWorkersSpecHash(t, dgd)
 		dgd.Annotations = map[string]string{
 			consts.AnnotationCurrentWorkerHash:   legacyHash,
@@ -2452,6 +2457,7 @@ func TestComponentRestartProgressResolver_CheckComponentFullyUpdated(t *testing.
 			},
 		})
 
+		t.Log("Verify readiness lookup finds the v2 generation")
 		r := createTestReconcilerWithStatus(dgd, withObjects(workerDCD))
 		ctx := context.Background()
 
@@ -4228,23 +4234,24 @@ func TestMapDGDWorkerPodToRequests(t *testing.T) {
 // --- reconcileRollingUpdate state machine tests ---
 
 func TestReconcileRollingUpdate_NoChange(t *testing.T) {
+	t.Log("Build a completed rollout with an opaque legacy suffix and a matching v2 hash")
+	const legacyHash = "legacy01"
 	dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 		"worker": {ComponentType: consts.ComponentTypeWorker},
 	})
-	hash := legacyDGDWorkersSpecHash(t, dgd)
 	v2Hash := betaDGDWorkersSpecHash(t, dgd)
 	dgd.Annotations = map[string]string{
-		consts.AnnotationCurrentWorkerHash:   hash,
+		consts.AnnotationCurrentWorkerHash:   legacyHash,
 		consts.AnnotationCurrentWorkerHashV2: v2Hash,
 	}
 	dgd.Status.RollingUpdate = &nvidiacomv1beta1.RollingUpdateStatus{
 		Phase: nvidiacomv1beta1.RollingUpdatePhaseCompleted,
 	}
 
+	t.Log("Reconcile without a spec change and verify the phase stays completed")
 	r := createTestReconcilerWithStatus(dgd)
 	err := r.reconcileRollingUpdate(context.Background(), dgd, &dgd.Status)
 	require.NoError(t, err)
-	// Phase should stay Completed — no spec change
 	assert.Equal(t, nvidiacomv1beta1.RollingUpdatePhaseCompleted, dgd.Status.RollingUpdate.Phase)
 }
 
@@ -4281,23 +4288,23 @@ func TestReconcileRollingUpdate_PendingToInProgress(t *testing.T) {
 }
 
 func TestReconcileRollingUpdate_HashMatchWithoutDrainRemainsInProgress(t *testing.T) {
+	t.Log("Build an in-progress rollout whose stored v2 hash already matches")
+	const legacyHash = "legacy01"
 	dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 		"worker": {ComponentType: consts.ComponentTypeWorker},
 	})
-	hash := legacyDGDWorkersSpecHash(t, dgd)
-	// Hash matches current but phase is InProgress — stuck
 	dgd.Annotations = map[string]string{
-		consts.AnnotationCurrentWorkerHash:   hash,
+		consts.AnnotationCurrentWorkerHash:   legacyHash,
 		consts.AnnotationCurrentWorkerHashV2: betaDGDWorkersSpecHash(t, dgd),
 	}
 	dgd.Status.RollingUpdate = &nvidiacomv1beta1.RollingUpdateStatus{
 		Phase: nvidiacomv1beta1.RollingUpdatePhaseInProgress,
 	}
 
+	t.Log("Verify a parent hash match is not completion evidence without an observed target")
 	r := createTestReconcilerWithStatus(dgd)
 	err := r.reconcileRollingUpdate(context.Background(), dgd, &dgd.Status)
 	require.NoError(t, err)
-	// A parent hash match is not completion evidence without an observed target.
 	assert.Equal(t, nvidiacomv1beta1.RollingUpdatePhaseInProgress, dgd.Status.RollingUpdate.Phase)
 }
 
@@ -4454,14 +4461,12 @@ func TestReconcileRollingUpdate_NonePhaseStartsRollout(t *testing.T) {
 }
 
 func TestReconcileRollingUpdate_InProgressAwaitsTargetDCDCacheObservation(t *testing.T) {
-	// Hash annotations are parent-side receipts, not target-readiness evidence.
-	// A resumed reconciliation must wait for the target DCD generation to exist
-	// and report ready before it can enter completion.
+	t.Log("Build an in-progress rollout with parent hash receipts but no observed target DCDs")
+	const legacyHash = "legacy01"
 	dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 		"prefill": {ComponentType: consts.ComponentTypePrefill},
 		"decode":  {ComponentType: consts.ComponentTypeDecode},
 	})
-	legacyHash := legacyDGDWorkersSpecHash(t, dgd)
 	v2Hash := betaDGDWorkersSpecHash(t, dgd)
 	dgd.Annotations = map[string]string{
 		consts.AnnotationCurrentWorkerHash:   legacyHash,
@@ -4471,10 +4476,10 @@ func TestReconcileRollingUpdate_InProgressAwaitsTargetDCDCacheObservation(t *tes
 		Phase: nvidiacomv1beta1.RollingUpdatePhaseInProgress,
 	}
 
+	t.Log("Verify reconciliation waits for ready target DCDs and preserves both stored hashes")
 	r := createTestReconcilerWithStatus(dgd)
 	err := r.reconcileRollingUpdate(context.Background(), dgd, &dgd.Status)
 	require.NoError(t, err)
-
 	assert.Equal(t, nvidiacomv1beta1.RollingUpdatePhaseInProgress, dgd.Status.RollingUpdate.Phase)
 	assert.Nil(t, dgd.Status.RollingUpdate.EndTime)
 	assert.Empty(t, dgd.Status.RollingUpdate.UpdatedComponents)

@@ -19,6 +19,7 @@ package v1alpha1
 
 import (
 	"encoding/json"
+	"maps"
 	"reflect"
 	"strings"
 	"testing"
@@ -38,6 +39,35 @@ import (
 )
 
 const backendFrameworkSGLang = "sglang"
+
+func TestDGDConversionPreservesWorkerHashAnnotationOpaquely(t *testing.T) {
+	t.Log("Build an alpha DGD with a controller-owned hash and a user annotation")
+	want := map[string]string{
+		"nvidia.com/current-worker-hash": "controller-owned-hash",
+		"user":                           "kept",
+	}
+	src := &DynamoGraphDeployment{
+		ObjectMeta: metav1.ObjectMeta{Annotations: maps.Clone(want)},
+	}
+
+	t.Log("Convert to the hub without interpreting the stored worker hash")
+	hub := &v1beta1.DynamoGraphDeployment{}
+	if err := src.ConvertTo(hub); err != nil {
+		t.Fatalf("ConvertTo: %v", err)
+	}
+	if diff := cmp.Diff(want, hub.Annotations); diff != "" {
+		t.Fatalf("hub annotations changed (-want +got):\n%s", diff)
+	}
+
+	t.Log("Convert back without changing the hash or user annotation")
+	out := &DynamoGraphDeployment{}
+	if err := out.ConvertFrom(hub); err != nil {
+		t.Fatalf("ConvertFrom: %v", err)
+	}
+	if diff := cmp.Diff(want, out.Annotations); diff != "" {
+		t.Fatalf("alpha annotations changed (-want +got):\n%s", diff)
+	}
+}
 
 func TestIsDynamoGraphDeploymentConversionAnnotation(t *testing.T) {
 	tests := []struct {

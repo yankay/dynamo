@@ -287,6 +287,7 @@ func TestBugDGD_HubEmptyPodTemplateRoundTrips(t *testing.T) {
 }
 
 func TestBugDGD_SpokeMainContainerNameOnlyRoundTrips(t *testing.T) {
+	t.Log("Build an alpha worker with only a main container name")
 	in := &DynamoGraphDeployment{
 		ObjectMeta: metav1.ObjectMeta{Name: "main-container-name-only", Namespace: "ns"},
 		Spec: DynamoGraphDeploymentSpec{
@@ -300,11 +301,8 @@ func TestBugDGD_SpokeMainContainerNameOnlyRoundTrips(t *testing.T) {
 			},
 		},
 	}
-	wantHash, err := ComputeDGDWorkersSpecHash(in)
-	if err != nil {
-		t.Fatalf("ComputeDGDWorkersSpecHash(in) error = %v", err)
-	}
 
+	t.Log("Round-trip the worker through the hub")
 	hub := &v1beta1.DynamoGraphDeployment{}
 	if err := in.ConvertTo(hub); err != nil {
 		t.Fatalf("ConvertTo() error = %v", err)
@@ -314,6 +312,7 @@ func TestBugDGD_SpokeMainContainerNameOnlyRoundTrips(t *testing.T) {
 		t.Fatalf("ConvertFrom() error = %v", err)
 	}
 
+	t.Log("Verify the explicitly named main container is preserved")
 	got := out.Spec.Services["worker"]
 	if got == nil || got.ExtraPodSpec == nil || got.ExtraPodSpec.MainContainer == nil {
 		t.Fatalf("mainContainer was lost after round-trip: %#v", got)
@@ -321,16 +320,13 @@ func TestBugDGD_SpokeMainContainerNameOnlyRoundTrips(t *testing.T) {
 	if got.ExtraPodSpec.MainContainer.Name != mainContainerName {
 		t.Fatalf("mainContainer.name = %q, want %q", got.ExtraPodSpec.MainContainer.Name, mainContainerName)
 	}
-	gotHash, err := ComputeDGDWorkersSpecHash(out)
-	if err != nil {
-		t.Fatalf("ComputeDGDWorkersSpecHash(out) error = %v", err)
-	}
-	if gotHash != wantHash {
-		t.Fatalf("round-trip worker hash = %q, want %q", gotHash, wantHash)
+	if diff := cmp.Diff(in.Spec.Services["worker"], got); diff != "" {
+		t.Fatalf("worker spec changed after round-trip (-want +got):\n%s", diff)
 	}
 }
 
 func TestBugDGD_SpokeMultipleCompilationCacheVolumeMountsRoundTrip(t *testing.T) {
+	t.Log("Build an alpha worker with multiple compilation cache mounts")
 	in := &DynamoGraphDeployment{
 		ObjectMeta: metav1.ObjectMeta{Name: "multi-cache", Namespace: "ns"},
 		Spec: DynamoGraphDeploymentSpec{
@@ -345,11 +341,8 @@ func TestBugDGD_SpokeMultipleCompilationCacheVolumeMountsRoundTrip(t *testing.T)
 			},
 		},
 	}
-	wantHash, err := ComputeDGDWorkersSpecHash(in)
-	if err != nil {
-		t.Fatalf("ComputeDGDWorkersSpecHash(in) error = %v", err)
-	}
 
+	t.Log("Verify the hub exposes the first cache and preserves all alpha mounts")
 	hub := &v1beta1.DynamoGraphDeployment{}
 	if err := in.ConvertTo(hub); err != nil {
 		t.Fatalf("ConvertTo() error = %v", err)
@@ -365,19 +358,13 @@ func TestBugDGD_SpokeMultipleCompilationCacheVolumeMountsRoundTrip(t *testing.T)
 		t.Fatalf("expected sparse save to preserve alpha volume mounts (-want +got):\n%s", diff)
 	}
 
+	t.Log("Convert back and verify all compilation cache mounts are preserved")
 	out := &DynamoGraphDeployment{}
 	if err := out.ConvertFrom(hub); err != nil {
 		t.Fatalf("ConvertFrom() error = %v", err)
 	}
 	if diff := cmp.Diff(in.Spec.Services["worker"].VolumeMounts, out.Spec.Services["worker"].VolumeMounts); diff != "" {
 		t.Fatalf("volume mounts changed after round-trip (-want +got):\n%s", diff)
-	}
-	gotHash, err := ComputeDGDWorkersSpecHash(out)
-	if err != nil {
-		t.Fatalf("ComputeDGDWorkersSpecHash(out) error = %v", err)
-	}
-	if gotHash != wantHash {
-		t.Fatalf("round-trip worker hash = %q, want %q", gotHash, wantHash)
 	}
 }
 
